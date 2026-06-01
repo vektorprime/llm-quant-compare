@@ -21,6 +21,27 @@ python .\compare_gguf_quant.py `
   --out-dir .\quant_compare_report
 ```
 
+Split GGUFs are supported. Pass every shard, or use a glob:
+
+```powershell
+python .\compare_gguf_quant.py `
+  --reference ".\models\Qwen3.6-27B-MTP-GGUF\BF16\Qwen3.6-27B-BF16-*.gguf" `
+  --quant ".\models\Qwen3.6-27B-MTP-GGUF\Qwen3.6-27B-Q8_0.gguf" `
+  --out-dir .\quant_compare_qwen36_27b_q8
+```
+
+To download the Qwen3.6 27B BF16 reference shards and Q8_0 candidate from
+Hugging Face:
+
+```powershell
+pip install -U huggingface_hub
+huggingface-cli download unsloth/Qwen3.6-27B-MTP-GGUF `
+  BF16/Qwen3.6-27B-BF16-00001-of-00002.gguf `
+  BF16/Qwen3.6-27B-BF16-00002-of-00002.gguf `
+  Qwen3.6-27B-Q8_0.gguf `
+  --local-dir .\models\Qwen3.6-27B-MTP-GGUF
+```
+
 Outputs:
 
 - `quant_compare_report\report.md`: human-readable summary and worst affected tensors.

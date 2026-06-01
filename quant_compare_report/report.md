@@ -1,9 +1,11 @@
 # GGUF Quantization Comparison
 - Reference: `Qwen3.5-2B-BF16.gguf`
 - Candidate: `Qwen3.5-2B-Q8_0.gguf`
+- Reference files: 1
+- Candidate files: 1
 - Compared tensors: 320
 - Compared elements: 1,881,825,088
-- Elapsed: 37.74 seconds
+- Elapsed: 39.91 seconds
 - Reference tensor types: `{"BF16": 187, "F32": 133}`
 - Candidate tensor types: `{"F32": 133, "Q8_0": 187}`
 
@@ -39,6 +41,8 @@ Layer and sublayer rows are computed by aggregating the underlying sums across a
 | `shape` | Tensor dimensions as stored in GGUF. | Read from tensor metadata. |
 | `type` / `quant_type` | Candidate GGML tensor type. | Read from the quantized GGUF metadata. |
 | `ref_type` | Reference GGML tensor type. | Read from the reference GGUF metadata. |
+| `ref_file` | Reference shard containing this tensor. Useful for split GGUFs. | Source path where the matched reference tensor was found. |
+| `quant_file` | Candidate shard containing this tensor. Useful for split GGUFs. | Source path where the matched candidate tensor was found. |
 | `elements` | Number of scalar values compared. | Product of tensor dimensions, or sum of elements for grouped rows. |
 | `ref_bytes` | On-disk bytes used by the reference tensor(s). | Computed from tensor type and element count. |
 | `quant_bytes` | On-disk bytes used by the candidate tensor(s). | Computed from tensor type and element count. Q8_0 uses 34 bytes per 32 values. |

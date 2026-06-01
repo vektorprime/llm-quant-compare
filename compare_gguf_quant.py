@@ -213,6 +213,7 @@ class TensorInfo:
     ggml_type: int
     relative_offset: int
     data_offset: int = 0
+    source_path: Path = field(default_factory=Path)
 
     @property
     def n_elements(self) -> int:
@@ -245,6 +246,41 @@ class GGUFFile:
     @property
     def tensors_by_name(self) -> dict[str, TensorInfo]:
         return {tensor.name: tensor for tensor in self.tensors}
+
+
+@dataclass
+class GGUFCollection:
+    label: str
+    files: list[GGUFFile]
+
+    @property
+    def paths(self) -> list[Path]:
+        return [file.path for file in self.files]
+
+    @property
+    def path_text(self) -> str:
+        return ", ".join(str(path) for path in self.paths)
+
+    @property
+    def metadata(self) -> dict[str, Any]:
+        return self.files[0].metadata if self.files else {}
+
+    @property
+    def tensors(self) -> list[TensorInfo]:
+        return [tensor for file in self.files for tensor in file.tensors]
+
+    @property
+    def tensors_by_name(self) -> dict[str, TensorInfo]:
+        by_name: dict[str, TensorInfo] = {}
+        for tensor in self.tensors:
+            if tensor.name in by_name:
+                first = by_name[tensor.name]
+                raise ValueError(
+                    f"{self.label}: duplicate tensor name {tensor.name!r} in "
+                    f"{first.source_path} and {tensor.source_path}"
+                )
+            by_name[tensor.name] = tensor
+        return by_name
 
 
 def tensor_nbytes(tensor: TensorInfo) -> int:
@@ -288,7 +324,7 @@ def parse_gguf(path: Path) -> GGUFFile:
             shape = tuple(read_u64(f) for _ in range(n_dimensions))
             ggml_type = read_u32(f)
             relative_offset = read_u64(f)
-            tensors.append(TensorInfo(name, shape, ggml_type, relative_offset))
+            tensors.append(TensorInfo(name, shape, ggml_type, relative_offset, source_path=path))
 
         data_start = align_to(f.tell(), alignment)
         file_size = path.stat().st_size
@@ -314,6 +350,16 @@ def parse_gguf(path: Path) -> GGUFFile:
         )
 
 
+def build_collection(label: str, paths: list[Path]) -> GGUFCollection:
+    if not paths:
+        raise ValueError(f"{label}: no GGUF paths provided")
+    files = [parse_gguf(path) for path in paths]
+    collection = GGUFCollection(label=label, files=files)
+    # Force duplicate detection early, before the expensive comparison starts.
+    _ = collection.tensors_by_name
+    return collection
+
+
 def open_mmap(path: Path) -> tuple[Any, mmap.mmap]:
     f = path.open("rb")
     try:
@@ -322,6 +368,33 @@ def open_mmap(path: Path) -> tuple[Any, mmap.mmap]:
         f.close()
         raise
     return f, mm
+
+
+def open_mmaps(paths: list[Path]) -> tuple[list[Any], list[mmap.mmap]]:
+    handles: list[Any] = []
+    maps: list[mmap.mmap] = []
+    try:
+        for path in paths:
+            handle, mm = open_mmap(path)
+            handles.append(handle)
+            maps.append(mm)
+    except Exception:
+        close_mmaps(handles, maps)
+        raise
+    return handles, maps
+
+
+def close_mmaps(handles: list[Any], maps: list[mmap.mmap]) -> None:
+    for mm in maps:
+        try:
+            mm.close()
+        except Exception:
+            pass
+    for handle in handles:
+        try:
+            handle.close()
+        except Exception:
+            pass
 
 
 def dequant_q8_0(mm: mmap.mmap, tensor: TensorInfo, block_start: int, block_count: int) -> np.ndarray:
@@ -548,6 +621,8 @@ def make_tensor_row(ref_tensor: TensorInfo, quant_tensor: TensorInfo, stats: Run
         "shape": ref_tensor.shape_text,
         "ref_type": ref_tensor.type_name,
         "quant_type": quant_tensor.type_name,
+        "ref_file": str(ref_tensor.source_path),
+        "quant_file": str(quant_tensor.source_path),
         "ref_bytes": ref_tensor.n_bytes,
         "quant_bytes": quant_tensor.n_bytes,
         "compression_ratio": ref_tensor.n_bytes / quant_tensor.n_bytes
@@ -694,7 +769,7 @@ def markdown_table(rows: list[dict[str, Any]], columns: list[tuple[str, str]], l
     return "\n".join(lines) + "\n"
 
 
-def type_counts(gguf: GGUFFile) -> dict[str, int]:
+def type_counts(gguf: GGUFFile | GGUFCollection) -> dict[str, int]:
     counts: dict[str, int] = {}
     for tensor in gguf.tensors:
         counts[tensor.type_name] = counts.get(tensor.type_name, 0) + 1
@@ -722,6 +797,8 @@ Layer and sublayer rows are computed by aggregating the underlying sums across a
 | `shape` | Tensor dimensions as stored in GGUF. | Read from tensor metadata. |
 | `type` / `quant_type` | Candidate GGML tensor type. | Read from the quantized GGUF metadata. |
 | `ref_type` | Reference GGML tensor type. | Read from the reference GGUF metadata. |
+| `ref_file` | Reference shard containing this tensor. Useful for split GGUFs. | Source path where the matched reference tensor was found. |
+| `quant_file` | Candidate shard containing this tensor. Useful for split GGUFs. | Source path where the matched candidate tensor was found. |
 | `elements` | Number of scalar values compared. | Product of tensor dimensions, or sum of elements for grouped rows. |
 | `ref_bytes` | On-disk bytes used by the reference tensor(s). | Computed from tensor type and element count. |
 | `quant_bytes` | On-disk bytes used by the candidate tensor(s). | Computed from tensor type and element count. Q8_0 uses 34 bytes per 32 values. |
@@ -751,8 +828,8 @@ Quick interpretation: sort by highest `rel_l2` or lowest `snr_db` to find tensor
 def write_markdown_report(
     path: Path,
     args: argparse.Namespace,
-    ref: GGUFFile,
-    quant: GGUFFile,
+    ref: GGUFCollection,
+    quant: GGUFCollection,
     tensor_rows: list[dict[str, Any]],
     layer_rows: list[dict[str, Any]],
     sublayer_rows: list[dict[str, Any]],
@@ -787,8 +864,10 @@ def write_markdown_report(
 
     text = []
     text.append("# GGUF Quantization Comparison\n")
-    text.append(f"- Reference: `{ref.path}`\n")
-    text.append(f"- Candidate: `{quant.path}`\n")
+    text.append(f"- Reference: `{ref.path_text}`\n")
+    text.append(f"- Candidate: `{quant.path_text}`\n")
+    text.append(f"- Reference files: {len(ref.files)}\n")
+    text.append(f"- Candidate files: {len(quant.files)}\n")
     text.append(f"- Compared tensors: {len(tensor_rows)}\n")
     text.append(f"- Compared elements: {total_metrics['elements']:,}\n")
     text.append(f"- Elapsed: {elapsed_s:.2f} seconds\n")
@@ -886,6 +965,8 @@ TENSOR_CSV_FIELDS = [
     "elements",
     "ref_type",
     "quant_type",
+    "ref_file",
+    "quant_file",
     "ref_bytes",
     "quant_bytes",
     "compression_ratio",
@@ -933,9 +1014,34 @@ GROUP_CSV_FIELDS = [
 ]
 
 
-def default_path(name: str) -> Path:
+def default_path(name: str | Path) -> Path:
     path = Path(name)
-    return path if path.exists() else Path.cwd() / name
+    return path if path.exists() or path.is_absolute() else Path.cwd() / path
+
+
+def expand_path_args(values: list[Path], label: str) -> list[Path]:
+    expanded: list[Path] = []
+    for value in values:
+        text = str(value)
+        if any(ch in text for ch in "*?[]"):
+            pattern_path = Path(text)
+            if pattern_path.is_absolute():
+                matches = sorted(pattern_path.parent.glob(pattern_path.name))
+            else:
+                matches = sorted(Path.cwd().glob(text))
+            if not matches:
+                raise FileNotFoundError(f"{label}: pattern matched no files: {text}")
+            expanded.extend(matches)
+        else:
+            expanded.append(default_path(value))
+
+    missing = [path for path in expanded if not path.exists()]
+    if missing:
+        raise FileNotFoundError(
+            f"{label}: missing file(s): " + ", ".join(str(path) for path in missing)
+        )
+
+    return expanded
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -949,16 +1055,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--reference",
         "--base",
         "--native",
-        default="Qwen3.5-2B-BF16.gguf",
+        default=[Path("Qwen3.5-2B-BF16.gguf")],
+        nargs="+",
         type=Path,
-        help="Reference/native GGUF, usually BF16 or F16.",
+        help=(
+            "Reference/native GGUF path(s), usually BF16 or F16. "
+            "Pass multiple files or a glob for split GGUFs."
+        ),
     )
     parser.add_argument(
         "--quant",
         "--candidate",
-        default="Qwen3.5-2B-Q8_0.gguf",
+        default=[Path("Qwen3.5-2B-Q8_0.gguf")],
+        nargs="+",
         type=Path,
-        help="Quantized GGUF to compare against the reference.",
+        help=(
+            "Quantized GGUF path(s) to compare against the reference. "
+            "Pass multiple files or a glob for split GGUFs."
+        ),
     )
     parser.add_argument(
         "--out-dir",
@@ -988,8 +1102,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
-    args.reference = default_path(str(args.reference))
-    args.quant = default_path(str(args.quant))
+    args.reference = expand_path_args(args.reference, "reference")
+    args.quant = expand_path_args(args.quant, "candidate")
 
     if args.chunk_blocks <= 0:
         raise ValueError("--chunk-blocks must be positive")
@@ -1000,8 +1114,8 @@ def main(argv: list[str] | None = None) -> int:
     exclude = re.compile(args.exclude) if args.exclude else None
 
     start_time = time.perf_counter()
-    ref = parse_gguf(args.reference)
-    quant = parse_gguf(args.quant)
+    ref = build_collection("reference", args.reference)
+    quant = build_collection("candidate", args.quant)
     ref_by_name = ref.tensors_by_name
     quant_by_name = quant.tensors_by_name
 
@@ -1047,17 +1161,21 @@ def main(argv: list[str] | None = None) -> int:
         progress = tqdm(total=total_elements, unit="el", unit_scale=True, desc="Comparing")
 
     tensor_rows: list[dict[str, Any]] = []
-    ref_handle = quant_handle = None
-    ref_mm = quant_mm = None
+    ref_handles: list[Any] = []
+    quant_handles: list[Any] = []
+    ref_mmaps: list[mmap.mmap] = []
+    quant_mmaps: list[mmap.mmap] = []
     try:
-        ref_handle, ref_mm = open_mmap(ref.path)
-        quant_handle, quant_mm = open_mmap(quant.path)
+        ref_handles, ref_mmaps = open_mmaps(ref.paths)
+        quant_handles, quant_mmaps = open_mmaps(quant.paths)
+        ref_mmap_by_path = dict(zip(ref.paths, ref_mmaps))
+        quant_mmap_by_path = dict(zip(quant.paths, quant_mmaps))
         for name in selected_names:
             ref_tensor = ref_by_name[name]
             quant_tensor = quant_by_name[name]
             stats = compare_tensor(
-                ref_mm,
-                quant_mm,
+                ref_mmap_by_path[ref_tensor.source_path],
+                quant_mmap_by_path[quant_tensor.source_path],
                 ref_tensor,
                 quant_tensor,
                 args.chunk_blocks,
@@ -1070,20 +1188,8 @@ def main(argv: list[str] | None = None) -> int:
     finally:
         if progress is not None:
             progress.close()
-        if ref_mm is not None:
-            try:
-                ref_mm.close()
-            except Exception:
-                pass
-        if quant_mm is not None:
-            try:
-                quant_mm.close()
-            except Exception:
-                pass
-        if ref_handle is not None:
-            ref_handle.close()
-        if quant_handle is not None:
-            quant_handle.close()
+        close_mmaps(ref_handles, ref_mmaps)
+        close_mmaps(quant_handles, quant_mmaps)
 
     tensor_rows.sort(key=lambda r: (-float(r["relative_l2_error"]), str(r["name"])))
     layer_rows = aggregate_rows(tensor_rows, "layer")
@@ -1099,8 +1205,8 @@ def main(argv: list[str] | None = None) -> int:
     write_csv(out_dir / "sublayer_metrics.csv", sublayer_rows, GROUP_CSV_FIELDS)
 
     summary = {
-        "reference": ref.path,
-        "candidate": quant.path,
+        "reference": ref.paths,
+        "candidate": quant.paths,
         "reference_metadata": ref.metadata,
         "candidate_metadata": quant.metadata,
         "compared_tensors": len(tensor_rows),
