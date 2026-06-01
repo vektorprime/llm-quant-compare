@@ -94,6 +94,11 @@ Each run folder contains:
 - `sublayer_metrics.csv`: aggregate drift per sublayer name across blocks.
 - `metrics.json`: machine-readable copy of all results.
 
+The Markdown report hides zero-error rows and skipped-tensor detail rows by
+default so the ranked tables stay focused on quantization drift. The full data
+is still written to CSV/JSON. Use `--show-zero-error` or `--show-skipped` when
+you want those rows included in `report.md`.
+
 ## Key Metrics
 
 - `relative_l2_error`: best single "badness" score. Higher means more quantization drift.

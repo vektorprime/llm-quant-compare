@@ -1,0 +1,2 @@
+layer,sublayer,elements,ref_bytes,quant_bytes,compression_ratio,mean_ref,mean_quant,mean_error,mean_abs_ref,mean_abs_quant,mae,mean_abs_relative_error,rmse,rms_ref,relative_l2_error,cosine_similarity,snr_db,max_abs_error,max_abs_error_index,ref_at_max_abs_error,quant_at_max_abs_error
+,attn_norm.weight,2048,8192,8192,1.0,1.0955547555349767,1.0955547555349767,0.0,1.0955547555349767,1.0955547555349767,0.0,0.0,0.0,1.1018968281033592,0.0,1.0,inf,0.0,0,1.0439453125,1.0439453125

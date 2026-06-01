@@ -1,0 +1,111 @@
+{
+  "candidate": [
+    "Qwen3.5-2B-Q8_0.gguf"
+  ],
+  "candidate_metadata": {
+    "general.architecture": "qwen35",
+    "general.file_type": 7,
+    "general.name": "Qwen3.5-2B",
+    "general.quantization_version": 2
+  },
+  "compared_elements": 2048,
+  "compared_tensors": 1,
+  "elapsed_seconds": 0.14340460000676103,
+  "layer_metrics": [
+    {
+      "compression_ratio": 1.0,
+      "cosine_similarity": 1.0,
+      "elements": 2048,
+      "layer": "blk.0",
+      "mae": 0.0,
+      "max_abs_error": 0.0,
+      "max_abs_error_index": 0,
+      "mean_abs_quant": 1.0955547555349767,
+      "mean_abs_ref": 1.0955547555349767,
+      "mean_abs_relative_error": 0.0,
+      "mean_error": 0.0,
+      "mean_quant": 1.0955547555349767,
+      "mean_ref": 1.0955547555349767,
+      "quant_at_max_abs_error": 1.0439453125,
+      "quant_bytes": 8192,
+      "ref_at_max_abs_error": 1.0439453125,
+      "ref_bytes": 8192,
+      "relative_l2_error": 0.0,
+      "rms_ref": 1.1018968281033592,
+      "rmse": 0.0,
+      "snr_db": "inf"
+    }
+  ],
+  "model_name": "Qwen3.5-2B",
+  "output_base_dir": "tmp_filter_zero",
+  "output_dir": "tmp_filter_zero\\Qwen3.5-2B-20260601-121201",
+  "reference": [
+    "Qwen3.5-2B-BF16.gguf"
+  ],
+  "reference_metadata": {
+    "general.architecture": "qwen35",
+    "general.file_type": 32,
+    "general.name": "Qwen3.5-2B",
+    "general.quantization_version": 2
+  },
+  "run_started_at": "2026-06-01T12:12:01",
+  "skipped": [],
+  "sublayer_metrics": [
+    {
+      "compression_ratio": 1.0,
+      "cosine_similarity": 1.0,
+      "elements": 2048,
+      "mae": 0.0,
+      "max_abs_error": 0.0,
+      "max_abs_error_index": 0,
+      "mean_abs_quant": 1.0955547555349767,
+      "mean_abs_ref": 1.0955547555349767,
+      "mean_abs_relative_error": 0.0,
+      "mean_error": 0.0,
+      "mean_quant": 1.0955547555349767,
+      "mean_ref": 1.0955547555349767,
+      "quant_at_max_abs_error": 1.0439453125,
+      "quant_bytes": 8192,
+      "ref_at_max_abs_error": 1.0439453125,
+      "ref_bytes": 8192,
+      "relative_l2_error": 0.0,
+      "rms_ref": 1.1018968281033592,
+      "rmse": 0.0,
+      "snr_db": "inf",
+      "sublayer": "attn_norm.weight"
+    }
+  ],
+  "tensor_metrics": [
+    {
+      "compression_ratio": 1.0,
+      "cosine_similarity": 1.0,
+      "elements": 2048,
+      "layer": "blk.0",
+      "layer_index": 0,
+      "mae": 0.0,
+      "max_abs_error": 0.0,
+      "max_abs_error_index": 0,
+      "mean_abs_quant": 1.0955547555349767,
+      "mean_abs_ref": 1.0955547555349767,
+      "mean_abs_relative_error": 0.0,
+      "mean_error": 0.0,
+      "mean_quant": 1.0955547555349767,
+      "mean_ref": 1.0955547555349767,
+      "name": "blk.0.attn_norm.weight",
+      "quant_at_max_abs_error": 1.0439453125,
+      "quant_bytes": 8192,
+      "quant_file": "Qwen3.5-2B-Q8_0.gguf",
+      "quant_type": "F32",
+      "ref_at_max_abs_error": 1.0439453125,
+      "ref_bytes": 8192,
+      "ref_file": "Qwen3.5-2B-BF16.gguf",
+      "ref_type": "F32",
+      "relative_l2_error": 0.0,
+      "rms_ref": 1.1018968281033592,
+      "rmse": 0.0,
+      "shape": "2048",
+      "snr_db": "inf",
+      "sublayer": "attn_norm.weight"
+    }
+  ]
+}

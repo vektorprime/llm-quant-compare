@@ -558,6 +558,23 @@ class RunningStats:
         }
 
 
+@dataclass
+class BlockOutlierInfo:
+    """Per-Q8_0-block statistics used to detect outlier-driven scale divergence."""
+    tensor_name: str
+    block_index: int          # 0-based block index within the tensor
+    scale: float              # the float16 scale d (dequantized to float32)
+    max_abs_ref: float        # max |ref| value in this 32-value block
+    rms_ref: float            # RMS of ref values in this block
+    max_abs_error: float      # max |quant - ref| in this block
+    outlier_score: float      # max_abs_ref / rms_ref  (higher = more extreme outlier)
+
+    @property
+    def global_element_index(self) -> int:
+        """Flattened element index where this block starts."""
+        return self.block_index * Q8_0_BLOCK_SIZE
+
+
 def split_layer_sublayer(name: str) -> tuple[str, str, int | None]:
     match = BLOCK_NAME_RE.match(name)
     if match:
@@ -574,8 +591,15 @@ def compare_tensor(
     chunk_blocks: int,
     chunk_values: int,
     progress: Any | None,
-) -> RunningStats:
+    collect_block_outliers: bool = False,
+) -> tuple[RunningStats, list[BlockOutlierInfo]]:
+    """Compare a tensor and optionally collect per-block outlier info for Q8_0 tensors.
+
+    Returns (stats, block_outliers) where block_outliers is populated only when
+    collect_block_outliers=True and the candidate tensor is Q8_0.
+    """
     stats = RunningStats()
+    block_outliers: list[BlockOutlierInfo] = []
     n = ref_tensor.n_elements
 
     if quant_tensor.ggml_type == GGML_Q8_0 or ref_tensor.ggml_type == GGML_Q8_0:
@@ -589,6 +613,13 @@ def compare_tensor(
             ref = read_values(ref_mm, ref_tensor, start, count)
             quant = read_values(quant_mm, quant_tensor, start, count)
             stats.update(ref, quant, start)
+
+            if collect_block_outliers and quant_tensor.ggml_type == GGML_Q8_0:
+                _collect_q8_0_block_outliers(
+                    block_outliers, ref_tensor, quant_tensor,
+                    ref, quant, ref_mm, quant_mm, block_start, block_count,
+                )
+
             if progress is not None:
                 progress.update(count)
     else:
@@ -600,7 +631,47 @@ def compare_tensor(
             if progress is not None:
                 progress.update(count)
 
-    return stats
+    return stats, block_outliers
+
+
+def _collect_q8_0_block_outliers(
+    block_outliers: list[BlockOutlierInfo],
+    ref_tensor: TensorInfo,
+    quant_tensor: TensorInfo,
+    ref: np.ndarray,
+    quant: np.ndarray,
+    ref_mm: mmap.mmap,
+    quant_mm: mmap.mmap,
+    block_start: int,
+    block_count: int,
+) -> None:
+    """Collect per-block outlier metrics by re-reading raw Q8_0 block headers."""
+    # Read raw Q8_0 block headers to get the scale for each block
+    byte_offset = quant_tensor.data_offset + block_start * Q8_0_DTYPE.itemsize
+    raw_blocks = np.frombuffer(quant_mm, dtype=Q8_0_DTYPE, count=block_count, offset=byte_offset)
+    scales = raw_blocks["d"].astype(np.float32)
+
+    # Reshape dequantized ref and error for per-block analysis
+    ref_reshaped = ref.reshape(-1, Q8_0_BLOCK_SIZE)
+    error = np.abs(np.subtract(quant, ref, dtype=np.float32)).reshape(-1, Q8_0_BLOCK_SIZE)
+
+    # Per-block metrics
+    max_abs_ref = np.max(np.abs(ref_reshaped), axis=1)
+    rms_ref = np.sqrt(np.mean(np.square(ref_reshaped, dtype=np.float64), axis=1))
+    max_abs_error = np.max(error, axis=1)
+
+    eps = 1e-30
+    for i in range(block_count):
+        score = float(max_abs_ref[i] / max(rms_ref[i], eps))
+        block_outliers.append(BlockOutlierInfo(
+            tensor_name=ref_tensor.name,
+            block_index=block_start + i,
+            scale=float(scales[i]),
+            max_abs_ref=float(max_abs_ref[i]),
+            rms_ref=float(rms_ref[i]),
+            max_abs_error=float(max_abs_error[i]),
+            outlier_score=score,
+        ))
 
 
 def passes_filters(name: str, include: re.Pattern[str] | None, exclude: re.Pattern[str] | None) -> bool:
@@ -676,6 +747,105 @@ def aggregate_rows(rows: Iterable[dict[str, Any]], key_field: str) -> list[dict[
         )
     out.sort(key=lambda r: (-float(r["relative_l2_error"]), str(r[key_field])))
     return out
+
+
+def analyze_block_outliers(
+    all_outliers: list[BlockOutlierInfo],
+    top: int,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Analyze Q8_0 block outliers and produce per-block and per-sublayer summaries.
+
+    Returns (worst_blocks, sublayer_summaries).
+    - worst_blocks: top-N individual blocks ranked by outlier_score descending.
+    - sublayer_summaries: aggregated by (layer, sublayer) with worst-block info.
+    """
+    if not all_outliers:
+        return [], []
+
+    # Sort all outliers by score descending
+    sorted_outliers = sorted(all_outliers, key=lambda b: -b.outlier_score)
+    worst_blocks = [
+        _block_outlier_to_row(b) for b in sorted_outliers[:top]
+    ]
+
+    # Group by (layer, sublayer)
+    grouped: dict[tuple[str, str], list[BlockOutlierInfo]] = {}
+    for b in all_outliers:
+        layer, sublayer, _ = split_layer_sublayer(b.tensor_name)
+        key = (layer, sublayer)
+        grouped.setdefault(key, []).append(b)
+
+    sublayer_summaries: list[dict[str, Any]] = []
+    for (layer, sublayer), blocks in grouped.items():
+        scores = [b.outlier_score for b in blocks]
+        max_abs_errors = [b.max_abs_error for b in blocks]
+        best = max(blocks, key=lambda b: b.outlier_score)
+        sublayer_summaries.append({
+            "layer": layer,
+            "sublayer": sublayer,
+            "tensor_name": best.tensor_name,
+            "total_q8_blocks": len(blocks),
+            "mean_outlier_score": sum(scores) / len(scores),
+            "max_outlier_score": best.outlier_score,
+            "worst_block_index": best.block_index,
+            "worst_block_global_index": best.global_element_index,
+            "worst_block_scale": best.scale,
+            "worst_block_max_abs_ref": best.max_abs_ref,
+            "worst_block_rms_ref": best.rms_ref,
+            "worst_block_max_abs_error": best.max_abs_error,
+            "mean_max_abs_error": sum(max_abs_errors) / len(max_abs_errors) if max_abs_errors else 0.0,
+        })
+
+    sublayer_summaries.sort(key=lambda r: -float(r["max_outlier_score"]))
+    return worst_blocks, sublayer_summaries
+
+
+def _block_outlier_to_row(b: BlockOutlierInfo) -> dict[str, Any]:
+    layer, sublayer, layer_index = split_layer_sublayer(b.tensor_name)
+    return {
+        "tensor_name": b.tensor_name,
+        "layer": layer,
+        "layer_index": layer_index,
+        "sublayer": sublayer,
+        "block_index": b.block_index,
+        "global_element_index": b.global_element_index,
+        "scale": b.scale,
+        "max_abs_ref": b.max_abs_ref,
+        "rms_ref": b.rms_ref,
+        "max_abs_error": b.max_abs_error,
+        "outlier_score": b.outlier_score,
+    }
+
+
+BLOCK_OUTLIER_CSV_FIELDS = [
+    "tensor_name",
+    "layer",
+    "layer_index",
+    "sublayer",
+    "block_index",
+    "global_element_index",
+    "scale",
+    "max_abs_ref",
+    "rms_ref",
+    "max_abs_error",
+    "outlier_score",
+]
+
+SUBBLAYER_BLOCK_OUTLIER_CSV_FIELDS = [
+    "layer",
+    "sublayer",
+    "tensor_name",
+    "total_q8_blocks",
+    "mean_outlier_score",
+    "max_outlier_score",
+    "worst_block_index",
+    "worst_block_global_index",
+    "worst_block_scale",
+    "worst_block_max_abs_ref",
+    "worst_block_rms_ref",
+    "worst_block_max_abs_error",
+    "mean_max_abs_error",
+]
 
 
 def stats_private_fields(stats: RunningStats) -> dict[str, float]:
@@ -770,6 +940,16 @@ def markdown_table(rows: list[dict[str, Any]], columns: list[tuple[str, str]], l
     return "\n".join(lines) + "\n"
 
 
+def has_measured_error(row: dict[str, Any]) -> bool:
+    for key in ("relative_l2_error", "rmse", "mae", "max_abs_error"):
+        value = float(row.get(key, 0.0))
+        if math.isnan(value):
+            return True
+        if value != 0.0:
+            return True
+    return False
+
+
 def type_counts(gguf: GGUFFile | GGUFCollection) -> dict[str, int]:
     counts: dict[str, int] = {}
     for tensor in gguf.tensors:
@@ -836,6 +1016,8 @@ def write_markdown_report(
     sublayer_rows: list[dict[str, Any]],
     skipped: list[dict[str, Any]],
     elapsed_s: float,
+    worst_block_outliers: list[dict[str, Any]] | None = None,
+    sublayer_block_outlier_rows: list[dict[str, Any]] | None = None,
 ) -> None:
     total_stats = RunningStats()
     for row in tensor_rows:
@@ -860,8 +1042,19 @@ def write_markdown_report(
         )
     total_metrics = total_stats.metrics()
 
-    worst_tensors = sorted(tensor_rows, key=lambda r: -float(r["relative_l2_error"]))
-    lowest_snr = sorted(tensor_rows, key=lambda r: float(r["snr_db"]))
+    report_tensor_rows = tensor_rows if args.show_zero_error else [
+        row for row in tensor_rows if has_measured_error(row)
+    ]
+    report_layer_rows = layer_rows if args.show_zero_error else [
+        row for row in layer_rows if has_measured_error(row)
+    ]
+    report_sublayer_rows = sublayer_rows if args.show_zero_error else [
+        row for row in sublayer_rows if has_measured_error(row)
+    ]
+    hidden_zero_error_rows = len(tensor_rows) - len(report_tensor_rows)
+
+    worst_tensors = sorted(report_tensor_rows, key=lambda r: -float(r["relative_l2_error"]))
+    lowest_snr = sorted(report_tensor_rows, key=lambda r: float(r["snr_db"]))
 
     text = []
     text.append("# GGUF Quantization Comparison\n")
@@ -875,6 +1068,10 @@ def write_markdown_report(
     text.append(f"- Elapsed: {elapsed_s:.2f} seconds\n")
     text.append(f"- Reference tensor types: `{json.dumps(type_counts(ref), sort_keys=True)}`\n")
     text.append(f"- Candidate tensor types: `{json.dumps(type_counts(quant), sort_keys=True)}`\n")
+    if hidden_zero_error_rows:
+        text.append(f"- Zero-error tensor rows hidden from ranked tables: {hidden_zero_error_rows}\n")
+    if skipped and not args.show_skipped:
+        text.append(f"- Skipped tensor rows hidden from this report: {len(skipped)}\n")
     text.append("\n")
     text.append("Q8_0 tensors are dequantized as `final_weight = float16_scale * int8_weight` for every 32-value block before comparison.\n")
     text.append("\n")
@@ -924,7 +1121,7 @@ def write_markdown_report(
     text.append("\n## Worst Layers\n\n")
     text.append(
         markdown_table(
-            layer_rows,
+            report_layer_rows,
             [
                 ("layer", "layer"),
                 ("elements", "elements"),
@@ -939,7 +1136,7 @@ def write_markdown_report(
     text.append("\n## Worst Sublayers Across Blocks\n\n")
     text.append(
         markdown_table(
-            sublayer_rows,
+            report_sublayer_rows,
             [
                 ("sublayer", "sublayer"),
                 ("elements", "elements"),
@@ -951,7 +1148,64 @@ def write_markdown_report(
             args.top,
         )
     )
-    if skipped:
+    if worst_block_outliers and sublayer_block_outlier_rows:
+        text.append("\n## Q8_0 Block Outlier Analysis\n\n")
+        text.append(
+            "Each Q8_0 tensor is stored as 32-value blocks that share a single float16 scale `d`. "
+            "The dequantized value is `d * int8_weight`. "
+            "When one or a few values in a block have much larger magnitude than the rest, "
+            "the scale is forced up to accommodate them, which reduces precision for all other "
+            "values in that block.\n\n"
+        )
+        text.append(
+            "**Outlier score** = `max_abs_ref / rms_ref` for each 32-value block. "
+            "A higher score means the reference values within that block have a more extreme "
+            "outlier (max value is much larger than the typical/RMS value). "
+            "These outlier-driven blocks are the primary cause of Q8_0 scale divergence "
+            "and precision loss.\n\n"
+        )
+        text.append("### Worst Individual Q8_0 Blocks by Outlier Score\n\n")
+        text.append(
+            markdown_table(
+                worst_block_outliers,
+                [
+                    ("tensor", "tensor_name"),
+                    ("layer", "layer"),
+                    ("sublayer", "sublayer"),
+                    ("block idx", "block_index"),
+                    ("outlier score", "outlier_score"),
+                    ("scale (d)", "scale"),
+                    ("max|ref|", "max_abs_ref"),
+                    ("rms ref", "rms_ref"),
+                    ("max|error|", "max_abs_error"),
+                ],
+                args.block_outlier_top if hasattr(args, 'block_outlier_top') else args.top,
+            )
+        )
+        text.append("\n### Sublayers Most Affected by Q8_0 Block Outliers\n\n")
+        text.append(
+            "Aggregated across all transformer blocks. "
+            "Higher `max_outlier_score` indicates sublayers where at least one Q8_0 block "
+            "has a severe outlier that drives the shared scale away from the typical value range.\n\n"
+        )
+        text.append(
+            markdown_table(
+                sublayer_block_outlier_rows,
+                [
+                    ("sublayer", "sublayer"),
+                    ("blocks", "total_q8_blocks"),
+                    ("max outlier score", "max_outlier_score"),
+                    ("mean outlier score", "mean_outlier_score"),
+                    ("worst block idx", "worst_block_index"),
+                    ("worst scale (d)", "worst_block_scale"),
+                    ("worst max|ref|", "worst_block_max_abs_ref"),
+                    ("worst rms ref", "worst_block_rms_ref"),
+                    ("worst max|error|", "worst_block_max_abs_error"),
+                ],
+                args.block_outlier_top if hasattr(args, 'block_outlier_top') else args.top,
+            )
+        )
+    if skipped and args.show_skipped:
         text.append("\n## Skipped\n\n")
         text.append(markdown_table(skipped, [("tensor", "name"), ("reason", "reason")], len(skipped)))
 
@@ -1155,6 +1409,22 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--top", default=25, type=int, help="Rows shown in Markdown top lists.")
     parser.add_argument("--max-tensors", type=int, help="Debug/validation limit after filtering.")
     parser.add_argument("--no-progress", action="store_true", help="Disable tqdm progress output.")
+    parser.add_argument(
+        "--show-zero-error",
+        action="store_true",
+        help="Include zero-error rows in Markdown ranked tables.",
+    )
+    parser.add_argument(
+        "--show-skipped",
+        action="store_true",
+        help="Include skipped tensor details in the Markdown report.",
+    )
+    parser.add_argument(
+        "--block-outlier-top",
+        default=25,
+        type=int,
+        help="Rows shown in Q8_0 block outlier Markdown tables (default: 25).",
+    )
     return parser
 
 
@@ -1223,6 +1493,7 @@ def main(argv: list[str] | None = None) -> int:
         progress = tqdm(total=total_elements, unit="el", unit_scale=True, desc="Comparing")
 
     tensor_rows: list[dict[str, Any]] = []
+    all_block_outliers: list[BlockOutlierInfo] = []
     ref_handles: list[Any] = []
     quant_handles: list[Any] = []
     ref_mmaps: list[mmap.mmap] = []
@@ -1235,7 +1506,7 @@ def main(argv: list[str] | None = None) -> int:
         for name in selected_names:
             ref_tensor = ref_by_name[name]
             quant_tensor = quant_by_name[name]
-            stats = compare_tensor(
+            stats, block_outliers = compare_tensor(
                 ref_mmap_by_path[ref_tensor.source_path],
                 quant_mmap_by_path[quant_tensor.source_path],
                 ref_tensor,
@@ -1243,10 +1514,12 @@ def main(argv: list[str] | None = None) -> int:
                 args.chunk_blocks,
                 args.chunk_values,
                 progress,
+                collect_block_outliers=True,
             )
             row = make_tensor_row(ref_tensor, quant_tensor, stats)
             row.update(stats_private_fields(stats))
             tensor_rows.append(row)
+            all_block_outliers.extend(block_outliers)
     finally:
         if progress is not None:
             progress.close()
@@ -1257,12 +1530,25 @@ def main(argv: list[str] | None = None) -> int:
     layer_rows = aggregate_rows(tensor_rows, "layer")
     sublayer_rows = aggregate_rows(tensor_rows, "sublayer")
 
+    # Analyze Q8_0 block outliers
+    worst_blocks, sublayer_block_outliers = analyze_block_outliers(
+        all_block_outliers, args.block_outlier_top
+    )
+
     elapsed_s = time.perf_counter() - start_time
 
     public_tensor_rows = [public_row(row) for row in tensor_rows]
     write_csv(out_dir / "tensor_metrics.csv", public_tensor_rows, TENSOR_CSV_FIELDS)
     write_csv(out_dir / "layer_metrics.csv", layer_rows, GROUP_CSV_FIELDS)
     write_csv(out_dir / "sublayer_metrics.csv", sublayer_rows, GROUP_CSV_FIELDS)
+    if worst_blocks:
+        write_csv(out_dir / "block_outliers.csv", worst_blocks, BLOCK_OUTLIER_CSV_FIELDS)
+    if sublayer_block_outliers:
+        write_csv(
+            out_dir / "sublayer_block_outliers.csv",
+            sublayer_block_outliers,
+            SUBLAYER_BLOCK_OUTLIER_CSV_FIELDS,
+        )
 
     summary = {
         "model_name": model_name,
@@ -1280,6 +1566,7 @@ def main(argv: list[str] | None = None) -> int:
         "layer_metrics": layer_rows,
         "sublayer_metrics": sublayer_rows,
         "skipped": skipped,
+        "q8_0_blocks_analyzed": len(all_block_outliers),
     }
     (out_dir / "metrics.json").write_text(
         json.dumps(json_safe(summary), indent=2, sort_keys=True),
@@ -1295,6 +1582,8 @@ def main(argv: list[str] | None = None) -> int:
         sublayer_rows,
         skipped,
         elapsed_s,
+        worst_block_outliers=worst_blocks if worst_blocks else None,
+        sublayer_block_outlier_rows=sublayer_block_outliers if sublayer_block_outliers else None,
     )
 
     print(f"Compared {len(tensor_rows)} tensors ({summary['compared_elements']:,} elements)")
@@ -1303,9 +1592,19 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Wrote {out_dir / 'tensor_metrics.csv'}")
     print(f"Wrote {out_dir / 'layer_metrics.csv'}")
     print(f"Wrote {out_dir / 'sublayer_metrics.csv'}")
+    if worst_blocks:
+        print(f"Wrote {out_dir / 'block_outliers.csv'} ({len(all_block_outliers):,} Q8_0 blocks analyzed)")
+    if sublayer_block_outliers:
+        print(f"Wrote {out_dir / 'sublayer_block_outliers.csv'}")
     print(f"Wrote {out_dir / 'metrics.json'}")
     if skipped:
-        print(f"Skipped {len(skipped)} tensors; see report.md")
+        if args.show_skipped:
+            print(f"Skipped {len(skipped)} tensors; see report.md and metrics.json")
+        else:
+            print(
+                f"Skipped {len(skipped)} tensors; details are in metrics.json "
+                f"(use --show-skipped to include them in report.md)"
+            )
     return 0
 
 
