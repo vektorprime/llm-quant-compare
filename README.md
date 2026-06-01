@@ -1,0 +1,41 @@
+# GGUF Quantization Comparison
+
+This directory contains a self-contained comparer for measuring value drift
+between a reference GGUF and a quantized GGUF.
+
+For Q8_0 tensors, the tool dequantizes every 32-value block as:
+
+```text
+final_weight = float16_scale * int8_weight
+```
+
+It then compares those final weights against the reference tensor values and
+writes tensor, layer, and sublayer summaries.
+
+## Run
+
+```powershell
+python .\compare_gguf_quant.py `
+  --reference .\Qwen3.5-2B-BF16.gguf `
+  --quant .\Qwen3.5-2B-Q8_0.gguf `
+  --out-dir .\quant_compare_report
+```
+
+Outputs:
+
+- `quant_compare_report\report.md`: human-readable summary and worst affected tensors.
+- `quant_compare_report\tensor_metrics.csv`: one row per tensor/sublayer.
+- `quant_compare_report\layer_metrics.csv`: aggregate drift per `blk.N` layer.
+- `quant_compare_report\sublayer_metrics.csv`: aggregate drift per sublayer name across blocks.
+- `quant_compare_report\metrics.json`: machine-readable copy of all results.
+
+## Key Metrics
+
+- `relative_l2_error`: best single "badness" score. Higher means more quantization drift.
+- `snr_db`: signal-to-noise ratio in dB. Lower means more quantization drift.
+- `rmse` and `mae`: absolute error magnitudes in the tensor's weight units.
+- `cosine_similarity`: directional agreement between reference and dequantized weights.
+- `max_abs_error`: largest single-value difference in the tensor.
+
+The script streams from memory-mapped files, so it does not load the full
+multi-GB GGUFs into RAM.
