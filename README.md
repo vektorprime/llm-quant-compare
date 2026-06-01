@@ -21,6 +21,11 @@ python .\compare_gguf_quant.py `
   --out-dir .\quant_compare_report
 ```
 
+Each run writes into a fresh subfolder named after the model plus the local
+date and time, for example
+`quant_compare_report\Qwen3.5-2B-20260601-113012`. Existing reports are never
+overwritten.
+
 Split GGUFs are supported. Pass every shard, or use a glob:
 
 ```powershell
@@ -42,13 +47,13 @@ huggingface-cli download unsloth/Qwen3.6-27B-MTP-GGUF `
   --local-dir .\models\Qwen3.6-27B-MTP-GGUF
 ```
 
-Outputs:
+Each run folder contains:
 
-- `quant_compare_report\report.md`: human-readable summary and worst affected tensors.
-- `quant_compare_report\tensor_metrics.csv`: one row per tensor/sublayer.
-- `quant_compare_report\layer_metrics.csv`: aggregate drift per `blk.N` layer.
-- `quant_compare_report\sublayer_metrics.csv`: aggregate drift per sublayer name across blocks.
-- `quant_compare_report\metrics.json`: machine-readable copy of all results.
+- `report.md`: human-readable summary and worst affected tensors.
+- `tensor_metrics.csv`: one row per tensor/sublayer.
+- `layer_metrics.csv`: aggregate drift per `blk.N` layer.
+- `sublayer_metrics.csv`: aggregate drift per sublayer name across blocks.
+- `metrics.json`: machine-readable copy of all results.
 
 ## Key Metrics
 

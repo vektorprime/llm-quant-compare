@@ -20,6 +20,7 @@ import struct
 import sys
 import time
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any, BinaryIO, Iterable
 
@@ -864,6 +865,7 @@ def write_markdown_report(
 
     text = []
     text.append("# GGUF Quantization Comparison\n")
+    text.append(f"- Output directory: `{path.parent}`\n")
     text.append(f"- Reference: `{ref.path_text}`\n")
     text.append(f"- Candidate: `{quant.path_text}`\n")
     text.append(f"- Reference files: {len(ref.files)}\n")
@@ -1044,6 +1046,59 @@ def expand_path_args(values: list[Path], label: str) -> list[Path]:
     return expanded
 
 
+def strip_model_suffixes(stem: str) -> str:
+    out = re.sub(r"-\d{5}-of-\d{5}$", "", stem)
+    quant_suffix = (
+        r"-(?:BF16|F16|F32|Q\d(?:_[0-9A-Z]+)+|IQ\d(?:_[0-9A-Z]+)+|"
+        r"UD-[0-9A-Z_]+|I\d+|MXFP4|TQ\d_0)$"
+    )
+    while True:
+        stripped = re.sub(quant_suffix, "", out, flags=re.IGNORECASE)
+        if stripped == out:
+            return out
+        out = stripped
+
+
+def sanitize_path_component(text: str) -> str:
+    text = text.strip()
+    text = re.sub(r"[<>:\"/\\|?*\x00-\x1f]+", "-", text)
+    text = re.sub(r"\s+", "-", text)
+    text = re.sub(r"-{2,}", "-", text)
+    return text.strip("-.") or "model"
+
+
+def infer_model_name(ref: GGUFCollection, quant: GGUFCollection) -> str:
+    for collection in (ref, quant):
+        name = collection.metadata.get("general.name")
+        if isinstance(name, str) and name.strip():
+            return sanitize_path_component(strip_model_suffixes(name.strip()))
+
+    stems = [strip_model_suffixes(path.stem) for path in ref.paths + quant.paths]
+    if stems:
+        common = os.path.commonprefix(stems).rstrip("-. _")
+        if common:
+            return sanitize_path_component(common)
+        return sanitize_path_component(stems[0])
+    return "model"
+
+
+def create_run_output_dir(base_dir: Path, model_name: str, started_at: datetime) -> Path:
+    base_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = started_at.strftime("%Y%m%d-%H%M%S")
+    stem = f"{sanitize_path_component(model_name)}-{timestamp}"
+
+    for i in range(10_000):
+        suffix = "" if i == 0 else f"-{i + 1}"
+        out_dir = base_dir / f"{stem}{suffix}"
+        try:
+            out_dir.mkdir(parents=True, exist_ok=False)
+            return out_dir
+        except FileExistsError:
+            continue
+
+    raise FileExistsError(f"could not create a unique output directory under {base_dir}")
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
@@ -1078,7 +1133,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--out-dir",
         default=Path("quant_compare_report"),
         type=Path,
-        help="Directory for CSV, JSON, and Markdown reports.",
+        help=(
+            "Base directory for reports. Each run creates a unique "
+            "model-name timestamped subdirectory here."
+        ),
     )
     parser.add_argument(
         "--chunk-blocks",
@@ -1104,6 +1162,7 @@ def main(argv: list[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
     args.reference = expand_path_args(args.reference, "reference")
     args.quant = expand_path_args(args.quant, "candidate")
+    run_started_at = datetime.now()
 
     if args.chunk_blocks <= 0:
         raise ValueError("--chunk-blocks must be positive")
@@ -1155,6 +1214,9 @@ def main(argv: list[str] | None = None) -> int:
     if not selected_names:
         raise ValueError("no comparable tensors selected")
 
+    model_name = infer_model_name(ref, quant)
+    out_dir = create_run_output_dir(args.out_dir, model_name, run_started_at)
+
     total_elements = sum(ref_by_name[name].n_elements for name in selected_names)
     progress = None
     if not args.no_progress and tqdm is not None:
@@ -1196,8 +1258,6 @@ def main(argv: list[str] | None = None) -> int:
     sublayer_rows = aggregate_rows(tensor_rows, "sublayer")
 
     elapsed_s = time.perf_counter() - start_time
-    out_dir = args.out_dir
-    out_dir.mkdir(parents=True, exist_ok=True)
 
     public_tensor_rows = [public_row(row) for row in tensor_rows]
     write_csv(out_dir / "tensor_metrics.csv", public_tensor_rows, TENSOR_CSV_FIELDS)
@@ -1205,6 +1265,10 @@ def main(argv: list[str] | None = None) -> int:
     write_csv(out_dir / "sublayer_metrics.csv", sublayer_rows, GROUP_CSV_FIELDS)
 
     summary = {
+        "model_name": model_name,
+        "run_started_at": run_started_at.isoformat(timespec="seconds"),
+        "output_base_dir": args.out_dir,
+        "output_dir": out_dir,
         "reference": ref.paths,
         "candidate": quant.paths,
         "reference_metadata": ref.metadata,
@@ -1234,6 +1298,7 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     print(f"Compared {len(tensor_rows)} tensors ({summary['compared_elements']:,} elements)")
+    print(f"Output directory: {out_dir}")
     print(f"Wrote {out_dir / 'report.md'}")
     print(f"Wrote {out_dir / 'tensor_metrics.csv'}")
     print(f"Wrote {out_dir / 'layer_metrics.csv'}")
