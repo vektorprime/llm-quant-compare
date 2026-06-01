@@ -14,6 +14,23 @@ writes tensor, layer, and sublayer summaries.
 
 ## Run
 
+Ubuntu setup:
+
+```bash
+python3 --version
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -U pip
+python -m pip install -r requirements.txt
+python compare_gguf_quant.py --help
+```
+
+The comparer needs Python 3.10 or newer. Runtime comparison needs `numpy`;
+`tqdm` provides progress bars; `huggingface_hub` is included for downloading
+GGUFs from Hugging Face.
+
+Windows example:
+
 ```powershell
 python .\compare_gguf_quant.py `
   --reference .\Qwen3.5-2B-BF16.gguf `
@@ -28,6 +45,17 @@ overwritten.
 
 Split GGUFs are supported. Pass every shard, or use a glob:
 
+Ubuntu example:
+
+```bash
+python compare_gguf_quant.py \
+  --reference "./models/Qwen3.6-27B-MTP-GGUF/BF16/Qwen3.6-27B-BF16-"*.gguf \
+  --quant "./models/Qwen3.6-27B-MTP-GGUF/Qwen3.6-27B-Q8_0.gguf" \
+  --out-dir ./quant_compare_qwen36_27b_q8
+```
+
+Windows example:
+
 ```powershell
 python .\compare_gguf_quant.py `
   --reference ".\models\Qwen3.6-27B-MTP-GGUF\BF16\Qwen3.6-27B-BF16-*.gguf" `
@@ -38,8 +66,19 @@ python .\compare_gguf_quant.py `
 To download the Qwen3.6 27B BF16 reference shards and Q8_0 candidate from
 Hugging Face:
 
+Ubuntu:
+
+```bash
+huggingface-cli download unsloth/Qwen3.6-27B-MTP-GGUF \
+  BF16/Qwen3.6-27B-BF16-00001-of-00002.gguf \
+  BF16/Qwen3.6-27B-BF16-00002-of-00002.gguf \
+  Qwen3.6-27B-Q8_0.gguf \
+  --local-dir ./models/Qwen3.6-27B-MTP-GGUF
+```
+
+Windows:
+
 ```powershell
-pip install -U huggingface_hub
 huggingface-cli download unsloth/Qwen3.6-27B-MTP-GGUF `
   BF16/Qwen3.6-27B-BF16-00001-of-00002.gguf `
   BF16/Qwen3.6-27B-BF16-00002-of-00002.gguf `
