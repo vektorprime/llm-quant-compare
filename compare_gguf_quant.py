@@ -579,7 +579,16 @@ def split_layer_sublayer(name: str) -> tuple[str, str, int | None]:
 
 
 OUTLIER_SCORE_THRESHOLDS = (("2", 2.0), ("3", 3.0), ("4", 4.0))
-MAX_ABS_ERROR_THRESHOLDS = (("0.01", 0.01), ("0.05", 0.05), ("0.1", 0.10))
+MAX_ABS_ERROR_THRESHOLDS = (
+    ("0.0005", 0.0005),
+    ("0.001", 0.001),
+    ("0.002", 0.002),
+    ("0.003", 0.003),
+    ("0.004", 0.004),
+    ("0.01", 0.01),
+    ("0.05", 0.05),
+    ("0.1", 0.10),
+)
 DISTRIBUTION_PERCENTILES = (50, 90, 95, 99)
 OUTLIER_SCORE_HIST_EDGES = np.concatenate((
     np.linspace(0.0, math.sqrt(Q8_0_BLOCK_SIZE), 4097, dtype=np.float64),
@@ -1263,6 +1272,16 @@ SUBLAYER_BLOCK_OUTLIER_CSV_FIELDS = [
     "max_abs_error_p90",
     "max_abs_error_p95",
     "max_abs_error_p99",
+    "max_abs_error_gt_0.0005_count",
+    "max_abs_error_gt_0.0005_pct",
+    "max_abs_error_gt_0.001_count",
+    "max_abs_error_gt_0.001_pct",
+    "max_abs_error_gt_0.002_count",
+    "max_abs_error_gt_0.002_pct",
+    "max_abs_error_gt_0.003_count",
+    "max_abs_error_gt_0.003_pct",
+    "max_abs_error_gt_0.004_count",
+    "max_abs_error_gt_0.004_pct",
     "max_abs_error_gt_0.01_count",
     "max_abs_error_gt_0.01_pct",
     "max_abs_error_gt_0.05_count",
@@ -1637,8 +1656,11 @@ def write_markdown_report(
             "The `*_gt_*_count` columns are exact counts of blocks whose value is above the threshold, "
             "and the matching `*_pct` columns are the percentage of `total_q8_blocks`. "
             "For example, `outlier_score_gt_3_pct` tells you what percentage of blocks have "
-            "`max_abs_ref / rms_ref > 3`, while `max_abs_error_gt_0.05_pct` tells you what "
-            "percentage of blocks have at least one dequantized value more than `0.05` away from reference.\n\n"
+            "`max_abs_ref / rms_ref > 3`, while `max_abs_error_gt_0.002_pct` tells you what "
+            "percentage of blocks have at least one dequantized value more than `0.002` away from reference. "
+            "The smaller `0.0005`, `0.001`, `0.002`, `0.003`, and `0.004` thresholds are intended "
+            "for Q8_0 comparisons where absolute weight errors are usually well below `0.01`; the older "
+            "`0.01`, `0.05`, and `0.1` thresholds are kept for compatibility and for unusually large-error models.\n\n"
         )
         text.append(
             "The percentile columns (`p50`, `p90`, `p95`, `p99`) summarize the whole distribution, "
@@ -1651,16 +1673,18 @@ def write_markdown_report(
         bad_block_rate_rows = sorted(
             sublayer_block_outlier_rows,
             key=lambda r: (
-                -float(r.get("max_abs_error_gt_0.05_pct", 0.0)),
+                -float(r.get("max_abs_error_gt_0.002_pct", 0.0)),
+                -float(r.get("max_abs_error_gt_0.003_pct", 0.0)),
                 -float(r.get("outlier_score_gt_3_pct", 0.0)),
                 -float(r.get("mean_max_abs_error", 0.0)),
             ),
         )
         text.append("### Sublayers With The Highest Bad-Block Rates\n\n")
         text.append(
-            "This table is ranked by `max_abs_error_gt_0.05_pct`, then `outlier_score_gt_3_pct`. "
-            "It is the quickest place to check whether a sublayer has many bad blocks, not merely a "
-            "single extreme block.\n\n"
+            "This table is ranked by `max_abs_error_gt_0.002_pct`, then `max_abs_error_gt_0.003_pct`, "
+            "then `outlier_score_gt_3_pct`. These thresholds match the typical Q8_0 absolute-error "
+            "range seen in this report better than the older `0.01+` thresholds. It is the quickest "
+            "place to check whether a sublayer has many bad blocks, not merely a single extreme block.\n\n"
         )
         text.append(
             markdown_table(
@@ -1668,13 +1692,14 @@ def write_markdown_report(
                 [
                     ("sublayer", "sublayer"),
                     ("blocks", "total_q8_blocks"),
-                    ("err>0.01 %", "max_abs_error_gt_0.01_pct"),
-                    ("err>0.05 %", "max_abs_error_gt_0.05_pct"),
-                    ("err>0.10 %", "max_abs_error_gt_0.1_pct"),
+                    ("err>0.0005 %", "max_abs_error_gt_0.0005_pct"),
+                    ("err>0.001 %", "max_abs_error_gt_0.001_pct"),
+                    ("err>0.002 %", "max_abs_error_gt_0.002_pct"),
+                    ("err>0.003 %", "max_abs_error_gt_0.003_pct"),
+                    ("err>0.004 %", "max_abs_error_gt_0.004_pct"),
                     ("score>3 %", "outlier_score_gt_3_pct"),
-                    ("score p95", "outlier_score_p95"),
                     ("err p95", "max_abs_error_p95"),
-                    ("mean max|err|", "mean_max_abs_error"),
+                    ("err p99", "max_abs_error_p99"),
                 ],
                 args.block_outlier_top if hasattr(args, 'block_outlier_top') else args.top,
             )
@@ -1699,7 +1724,8 @@ def write_markdown_report(
                     ("score>2 %", "outlier_score_gt_2_pct"),
                     ("score>3 %", "outlier_score_gt_3_pct"),
                     ("err p99", "max_abs_error_p99"),
-                    ("err>0.05 %", "max_abs_error_gt_0.05_pct"),
+                    ("err>0.002 %", "max_abs_error_gt_0.002_pct"),
+                    ("err>0.003 %", "max_abs_error_gt_0.003_pct"),
                     ("worst max|err|", "worst_block_max_abs_error"),
                 ],
                 args.block_outlier_top if hasattr(args, 'block_outlier_top') else args.top,
