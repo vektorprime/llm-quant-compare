@@ -578,25 +578,132 @@ def split_layer_sublayer(name: str) -> tuple[str, str, int | None]:
     return "global", name, None
 
 
+OUTLIER_SCORE_THRESHOLDS = (2.0, 3.0, 4.0)
+MAX_ABS_ERROR_THRESHOLDS = (0.01, 0.05, 0.10)
+DISTRIBUTION_PERCENTILES = (50, 90, 95, 99)
+OUTLIER_SCORE_HIST_EDGES = np.concatenate((
+    np.linspace(0.0, math.sqrt(Q8_0_BLOCK_SIZE), 4097, dtype=np.float64),
+    np.array([np.inf], dtype=np.float64),
+))
+MAX_ABS_ERROR_HIST_EDGES = np.concatenate((
+    np.array([0.0], dtype=np.float64),
+    np.logspace(-12, 6, 4097, dtype=np.float64),
+    np.array([np.inf], dtype=np.float64),
+))
+
+
+def threshold_suffix(value: float) -> str:
+    return f"{value:g}"
+
+
+def histogram_percentile(hist: np.ndarray, edges: np.ndarray, percentile: int) -> float:
+    total = int(np.sum(hist, dtype=np.int64))
+    if total <= 0:
+        return math.nan
+
+    target = (float(percentile) / 100.0) * total
+    target = min(max(target, 1.0), float(total))
+    cumulative = np.cumsum(hist, dtype=np.int64)
+    bin_index = int(np.searchsorted(cumulative, target, side="left"))
+    if bin_index >= len(hist):
+        return float(edges[-2])
+
+    left = float(edges[bin_index])
+    right = float(edges[bin_index + 1])
+    if not math.isfinite(right):
+        return left
+
+    previous = int(cumulative[bin_index - 1]) if bin_index else 0
+    bin_count = int(hist[bin_index])
+    if bin_count <= 0:
+        return left
+
+    fraction = (target - previous) / bin_count
+    fraction = min(max(fraction, 0.0), 1.0)
+    return left + (right - left) * fraction
+
+
 @dataclass
 class SublayerBlockOutlierAccumulator:
     total_q8_blocks: int = 0
     sum_outlier_score: float = 0.0
     sum_max_abs_error: float = 0.0
     best: BlockOutlierInfo | None = None
+    outlier_score_gt_counts: list[int] = field(
+        default_factory=lambda: [0] * len(OUTLIER_SCORE_THRESHOLDS)
+    )
+    max_abs_error_gt_counts: list[int] = field(
+        default_factory=lambda: [0] * len(MAX_ABS_ERROR_THRESHOLDS)
+    )
+    outlier_score_hist: np.ndarray = field(
+        default_factory=lambda: np.zeros(len(OUTLIER_SCORE_HIST_EDGES) - 1, dtype=np.int64)
+    )
+    max_abs_error_hist: np.ndarray = field(
+        default_factory=lambda: np.zeros(len(MAX_ABS_ERROR_HIST_EDGES) - 1, dtype=np.int64)
+    )
 
-    def update(
+    def update_arrays(
         self,
-        count: int,
-        score_sum: float,
-        max_abs_error_sum: float,
+        scores: np.ndarray,
+        max_abs_error: np.ndarray,
         best: BlockOutlierInfo,
     ) -> None:
+        count = int(scores.size)
+        if count <= 0:
+            return
+
         self.total_q8_blocks += count
-        self.sum_outlier_score += score_sum
-        self.sum_max_abs_error += max_abs_error_sum
+        self.sum_outlier_score += float(np.sum(scores, dtype=np.float64))
+        self.sum_max_abs_error += float(np.sum(max_abs_error, dtype=np.float64))
+
+        for i, threshold in enumerate(OUTLIER_SCORE_THRESHOLDS):
+            self.outlier_score_gt_counts[i] += int(np.count_nonzero(scores > threshold))
+        for i, threshold in enumerate(MAX_ABS_ERROR_THRESHOLDS):
+            self.max_abs_error_gt_counts[i] += int(np.count_nonzero(max_abs_error > threshold))
+
+        self.outlier_score_hist += np.histogram(scores, bins=OUTLIER_SCORE_HIST_EDGES)[0]
+        self.max_abs_error_hist += np.histogram(max_abs_error, bins=MAX_ABS_ERROR_HIST_EDGES)[0]
+
         if self.best is None or best.outlier_score > self.best.outlier_score:
             self.best = best
+
+    def merge(self, other: "SublayerBlockOutlierAccumulator") -> None:
+        self.total_q8_blocks += other.total_q8_blocks
+        self.sum_outlier_score += other.sum_outlier_score
+        self.sum_max_abs_error += other.sum_max_abs_error
+        self.outlier_score_gt_counts = [
+            a + b for a, b in zip(self.outlier_score_gt_counts, other.outlier_score_gt_counts)
+        ]
+        self.max_abs_error_gt_counts = [
+            a + b for a, b in zip(self.max_abs_error_gt_counts, other.max_abs_error_gt_counts)
+        ]
+        self.outlier_score_hist += other.outlier_score_hist
+        self.max_abs_error_hist += other.max_abs_error_hist
+        if other.best is not None and (
+            self.best is None or other.best.outlier_score > self.best.outlier_score
+        ):
+            self.best = other.best
+
+    def add_distribution_fields(self, row: dict[str, Any]) -> None:
+        total = max(self.total_q8_blocks, 1)
+
+        for percentile in DISTRIBUTION_PERCENTILES:
+            row[f"outlier_score_p{percentile}"] = histogram_percentile(
+                self.outlier_score_hist, OUTLIER_SCORE_HIST_EDGES, percentile
+            )
+            row[f"max_abs_error_p{percentile}"] = histogram_percentile(
+                self.max_abs_error_hist, MAX_ABS_ERROR_HIST_EDGES, percentile
+            )
+
+        for threshold, count in zip(OUTLIER_SCORE_THRESHOLDS, self.outlier_score_gt_counts):
+            suffix = threshold_suffix(threshold)
+            row[f"outlier_score_gt_{suffix}_count"] = count
+            row[f"outlier_score_gt_{suffix}_pct"] = 100.0 * count / total
+
+        for threshold, count in zip(MAX_ABS_ERROR_THRESHOLDS, self.max_abs_error_gt_counts):
+            suffix = threshold_suffix(threshold)
+            row[f"max_abs_error_gt_{suffix}_count"] = count
+            row[f"max_abs_error_gt_{suffix}_pct"] = 100.0 * count / total
 
 
 class Q8BlockOutlierAnalyzer:
@@ -656,10 +763,9 @@ class Q8BlockOutlierAnalyzer:
         )
         layer, sublayer, _ = split_layer_sublayer(ref_tensor.name)
         key = (layer, sublayer)
-        self._sublayers.setdefault(key, SublayerBlockOutlierAccumulator()).update(
-            block_count,
-            float(np.sum(scores, dtype=np.float64)),
-            float(np.sum(max_abs_error, dtype=np.float64)),
+        self._sublayers.setdefault(key, SublayerBlockOutlierAccumulator()).update_arrays(
+            scores,
+            max_abs_error,
             best,
         )
 
@@ -724,12 +830,7 @@ class Q8BlockOutlierAnalyzer:
         for key, other_acc in other._sublayers.items():
             if other_acc.total_q8_blocks == 0 or other_acc.best is None:
                 continue
-            self._sublayers.setdefault(key, SublayerBlockOutlierAccumulator()).update(
-                other_acc.total_q8_blocks,
-                other_acc.sum_outlier_score,
-                other_acc.sum_max_abs_error,
-                other_acc.best,
-            )
+            self._sublayers.setdefault(key, SublayerBlockOutlierAccumulator()).merge(other_acc)
 
     def worst_block_rows(self) -> list[dict[str, Any]]:
         blocks = [item[2] for item in self._top_heap]
@@ -742,21 +843,23 @@ class Q8BlockOutlierAnalyzer:
             if acc.total_q8_blocks == 0 or acc.best is None:
                 continue
             best = acc.best
-            rows.append({
+            row = {
                 "layer": layer,
                 "sublayer": sublayer,
                 "tensor_name": best.tensor_name,
                 "total_q8_blocks": acc.total_q8_blocks,
                 "mean_outlier_score": acc.sum_outlier_score / acc.total_q8_blocks,
                 "max_outlier_score": best.outlier_score,
+                "mean_max_abs_error": acc.sum_max_abs_error / acc.total_q8_blocks,
                 "worst_block_index": best.block_index,
                 "worst_block_global_index": best.global_element_index,
                 "worst_block_scale": best.scale,
                 "worst_block_max_abs_ref": best.max_abs_ref,
                 "worst_block_rms_ref": best.rms_ref,
                 "worst_block_max_abs_error": best.max_abs_error,
-                "mean_max_abs_error": acc.sum_max_abs_error / acc.total_q8_blocks,
-            })
+            }
+            acc.add_distribution_fields(row)
+            rows.append(row)
         rows.sort(key=lambda r: -float(r["max_outlier_score"]))
         return rows
 
@@ -1150,14 +1253,34 @@ SUBLAYER_BLOCK_OUTLIER_CSV_FIELDS = [
     "tensor_name",
     "total_q8_blocks",
     "mean_outlier_score",
+    "outlier_score_p50",
+    "outlier_score_p90",
+    "outlier_score_p95",
+    "outlier_score_p99",
+    "outlier_score_gt_2_count",
+    "outlier_score_gt_2_pct",
+    "outlier_score_gt_3_count",
+    "outlier_score_gt_3_pct",
+    "outlier_score_gt_4_count",
+    "outlier_score_gt_4_pct",
     "max_outlier_score",
+    "mean_max_abs_error",
+    "max_abs_error_p50",
+    "max_abs_error_p90",
+    "max_abs_error_p95",
+    "max_abs_error_p99",
+    "max_abs_error_gt_0.01_count",
+    "max_abs_error_gt_0.01_pct",
+    "max_abs_error_gt_0.05_count",
+    "max_abs_error_gt_0.05_pct",
+    "max_abs_error_gt_0.1_count",
+    "max_abs_error_gt_0.1_pct",
     "worst_block_index",
     "worst_block_global_index",
     "worst_block_scale",
     "worst_block_max_abs_ref",
     "worst_block_rms_ref",
     "worst_block_max_abs_error",
-    "mean_max_abs_error",
 ]
 
 
@@ -1235,11 +1358,15 @@ def fmt_float(value: Any, digits: int = 6) -> str:
     return f"{x:.{digits}g}"
 
 
+def markdown_cell(value: Any) -> str:
+    return str(value).replace("|", r"\|")
+
+
 def markdown_table(rows: list[dict[str, Any]], columns: list[tuple[str, str]], limit: int) -> str:
     selected = rows[:limit]
     if not selected:
         return "_None._\n"
-    header = "| " + " | ".join(label for label, _ in columns) + " |"
+    header = "| " + " | ".join(markdown_cell(label) for label, _ in columns) + " |"
     sep = "| " + " | ".join("---" for _ in columns) + " |"
     lines = [header, sep]
     for row in selected:
@@ -1248,7 +1375,7 @@ def markdown_table(rows: list[dict[str, Any]], columns: list[tuple[str, str]], l
             value = row.get(key, "")
             if isinstance(value, float):
                 value = fmt_float(value)
-            values.append(str(value))
+            values.append(markdown_cell(value))
         lines.append("| " + " | ".join(values) + " |")
     return "\n".join(lines) + "\n"
 
@@ -1496,11 +1623,61 @@ def write_markdown_report(
                 args.block_outlier_top if hasattr(args, 'block_outlier_top') else args.top,
             )
         )
+        text.append("\n### Bad-Block Distribution Columns\n\n")
+        text.append(
+            "`sublayer_block_outliers.csv` now includes both worst-block fields and distribution fields. "
+            "The `*_gt_*_count` columns are exact counts of blocks whose value is above the threshold, "
+            "and the matching `*_pct` columns are the percentage of `total_q8_blocks`. "
+            "For example, `outlier_score_gt_3_pct` tells you what percentage of blocks have "
+            "`max_abs_ref / rms_ref > 3`, while `max_abs_error_gt_0.05_pct` tells you what "
+            "percentage of blocks have at least one dequantized value more than `0.05` away from reference.\n\n"
+        )
+        text.append(
+            "The percentile columns (`p50`, `p90`, `p95`, `p99`) summarize the whole distribution, "
+            "not just the single worst block. They are estimated from streaming histograms so the script "
+            "does not need to keep every Q8_0 block in memory. Use high `p95`/`p99` values together with "
+            "high threshold percentages to identify sublayers where many blocks are bad, rather than one "
+            "isolated worst block.\n\n"
+        )
+
+        bad_block_rate_rows = sorted(
+            sublayer_block_outlier_rows,
+            key=lambda r: (
+                -float(r.get("max_abs_error_gt_0.05_pct", 0.0)),
+                -float(r.get("outlier_score_gt_3_pct", 0.0)),
+                -float(r.get("mean_max_abs_error", 0.0)),
+            ),
+        )
+        text.append("### Sublayers With The Highest Bad-Block Rates\n\n")
+        text.append(
+            "This table is ranked by `max_abs_error_gt_0.05_pct`, then `outlier_score_gt_3_pct`. "
+            "It is the quickest place to check whether a sublayer has many bad blocks, not merely a "
+            "single extreme block.\n\n"
+        )
+        text.append(
+            markdown_table(
+                bad_block_rate_rows,
+                [
+                    ("sublayer", "sublayer"),
+                    ("blocks", "total_q8_blocks"),
+                    ("err>0.01 %", "max_abs_error_gt_0.01_pct"),
+                    ("err>0.05 %", "max_abs_error_gt_0.05_pct"),
+                    ("err>0.10 %", "max_abs_error_gt_0.1_pct"),
+                    ("score>3 %", "outlier_score_gt_3_pct"),
+                    ("score p95", "outlier_score_p95"),
+                    ("err p95", "max_abs_error_p95"),
+                    ("mean max|err|", "mean_max_abs_error"),
+                ],
+                args.block_outlier_top if hasattr(args, 'block_outlier_top') else args.top,
+            )
+        )
+
         text.append("\n### Sublayers Most Affected by Q8_0 Block Outliers\n\n")
         text.append(
-            "Aggregated across all transformer blocks. "
-            "Higher `max_outlier_score` indicates sublayers where at least one Q8_0 block "
-            "has a severe outlier that drives the shared scale away from the typical value range.\n\n"
+            "Aggregated across all transformer blocks. Higher `max_outlier_score` indicates sublayers "
+            "where at least one Q8_0 block has a severe outlier that drives the shared scale away from "
+            "the typical value range. The added distribution columns show whether that worst case is "
+            "isolated or part of a broader pattern.\n\n"
         )
         text.append(
             markdown_table(
@@ -1508,13 +1685,14 @@ def write_markdown_report(
                 [
                     ("sublayer", "sublayer"),
                     ("blocks", "total_q8_blocks"),
-                    ("max outlier score", "max_outlier_score"),
-                    ("mean outlier score", "mean_outlier_score"),
-                    ("worst block idx", "worst_block_index"),
-                    ("worst scale (d)", "worst_block_scale"),
-                    ("worst max|ref|", "worst_block_max_abs_ref"),
-                    ("worst rms ref", "worst_block_rms_ref"),
-                    ("worst max|error|", "worst_block_max_abs_error"),
+                    ("max score", "max_outlier_score"),
+                    ("mean score", "mean_outlier_score"),
+                    ("score p99", "outlier_score_p99"),
+                    ("score>2 %", "outlier_score_gt_2_pct"),
+                    ("score>3 %", "outlier_score_gt_3_pct"),
+                    ("err p99", "max_abs_error_p99"),
+                    ("err>0.05 %", "max_abs_error_gt_0.05_pct"),
+                    ("worst max|err|", "worst_block_max_abs_error"),
                 ],
                 args.block_outlier_top if hasattr(args, 'block_outlier_top') else args.top,
             )
