@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import heapq
 import json
 import math
 import mmap
@@ -401,9 +402,9 @@ def close_mmaps(handles: list[Any], maps: list[mmap.mmap]) -> None:
 def dequant_q8_0(mm: mmap.mmap, tensor: TensorInfo, block_start: int, block_count: int) -> np.ndarray:
     byte_offset = tensor.data_offset + block_start * Q8_0_DTYPE.itemsize
     blocks = np.frombuffer(mm, dtype=Q8_0_DTYPE, count=block_count, offset=byte_offset)
-    scales = blocks["d"].astype(np.float32).reshape(-1, 1)
-    qs = blocks["qs"].astype(np.float32)
-    return np.multiply(qs, scales, dtype=np.float32).reshape(-1)
+    values = blocks["qs"].astype(np.float32)
+    values *= blocks["d"].astype(np.float32).reshape(-1, 1)
+    return values.reshape(-1)
 
 
 def read_dense_values(mm: mmap.mmap, tensor: TensorInfo, start: int, count: int) -> np.ndarray:
@@ -455,27 +456,19 @@ class RunningStats:
             raise ValueError(f"shape mismatch in chunk: {ref.shape} vs {quant.shape}")
 
         error = np.subtract(quant, ref, dtype=np.float32)
-        abs_ref = np.abs(ref)
-        abs_quant = np.abs(quant)
         abs_error = np.abs(error)
 
         self.n += int(ref.size)
         self.sum_ref += float(np.sum(ref, dtype=np.float64))
         self.sum_quant += float(np.sum(quant, dtype=np.float64))
-        self.sum_abs_ref += float(np.sum(abs_ref, dtype=np.float64))
-        self.sum_abs_quant += float(np.sum(abs_quant, dtype=np.float64))
+        self.sum_abs_ref += float(np.sum(np.abs(ref), dtype=np.float64))
+        self.sum_abs_quant += float(np.sum(np.abs(quant), dtype=np.float64))
         self.sum_error += float(np.sum(error, dtype=np.float64))
         self.sum_abs_error += float(np.sum(abs_error, dtype=np.float64))
-        self.sum_squared_error += float(
-            np.sum(np.multiply(error, error, dtype=np.float64), dtype=np.float64)
-        )
-        self.sum_squared_ref += float(
-            np.sum(np.multiply(ref, ref, dtype=np.float64), dtype=np.float64)
-        )
-        self.sum_squared_quant += float(
-            np.sum(np.multiply(quant, quant, dtype=np.float64), dtype=np.float64)
-        )
-        self.dot += float(np.sum(np.multiply(ref, quant, dtype=np.float64), dtype=np.float64))
+        self.sum_squared_error += float(np.einsum("i,i->", error, error, dtype=np.float64))
+        self.sum_squared_ref += float(np.einsum("i,i->", ref, ref, dtype=np.float64))
+        self.sum_squared_quant += float(np.einsum("i,i->", quant, quant, dtype=np.float64))
+        self.dot += float(np.einsum("i,i->", ref, quant, dtype=np.float64))
 
         local_index = int(np.argmax(abs_error))
         local_max = float(abs_error[local_index])
@@ -583,6 +576,170 @@ def split_layer_sublayer(name: str) -> tuple[str, str, int | None]:
     return "global", name, None
 
 
+@dataclass
+class SublayerBlockOutlierAccumulator:
+    total_q8_blocks: int = 0
+    sum_outlier_score: float = 0.0
+    sum_max_abs_error: float = 0.0
+    best: BlockOutlierInfo | None = None
+
+    def update(
+        self,
+        count: int,
+        score_sum: float,
+        max_abs_error_sum: float,
+        best: BlockOutlierInfo,
+    ) -> None:
+        self.total_q8_blocks += count
+        self.sum_outlier_score += score_sum
+        self.sum_max_abs_error += max_abs_error_sum
+        if self.best is None or best.outlier_score > self.best.outlier_score:
+            self.best = best
+
+
+class Q8BlockOutlierAnalyzer:
+    """Streaming top-N and grouped Q8_0 block outlier analysis.
+
+    The original implementation kept one Python object for every Q8_0 block and
+    sorted them at the end. Large GGUFs can contain tens of millions of blocks,
+    so that made this phase both CPU- and memory-heavy. This keeps only the
+    requested top-N blocks while still accumulating exact per-sublayer totals.
+    """
+
+    def __init__(self, top: int) -> None:
+        self.top = max(0, int(top))
+        self.total_blocks = 0
+        self._counter = 0
+        self._top_heap: list[tuple[float, int, BlockOutlierInfo]] = []
+        self._sublayers: dict[tuple[str, str], SublayerBlockOutlierAccumulator] = {}
+
+    def update(
+        self,
+        ref_tensor: TensorInfo,
+        quant_tensor: TensorInfo,
+        ref: np.ndarray,
+        quant: np.ndarray,
+        quant_mm: mmap.mmap,
+        block_start: int,
+        block_count: int,
+    ) -> None:
+        if block_count <= 0:
+            return
+
+        byte_offset = quant_tensor.data_offset + block_start * Q8_0_DTYPE.itemsize
+        raw_blocks = np.frombuffer(quant_mm, dtype=Q8_0_DTYPE, count=block_count, offset=byte_offset)
+        scales = raw_blocks["d"].astype(np.float32)
+
+        ref_blocks = ref.reshape(block_count, Q8_0_BLOCK_SIZE)
+        quant_blocks = quant.reshape(block_count, Q8_0_BLOCK_SIZE)
+        max_abs_ref = np.max(np.abs(ref_blocks), axis=1)
+        ref_sq_sum = np.einsum("ij,ij->i", ref_blocks, ref_blocks, dtype=np.float64)
+        rms_ref = np.sqrt(ref_sq_sum / Q8_0_BLOCK_SIZE)
+        error = np.subtract(quant_blocks, ref_blocks, dtype=np.float32)
+        max_abs_error = np.max(np.abs(error), axis=1)
+        scores = max_abs_ref / np.maximum(rms_ref, 1e-30)
+
+        self.total_blocks += block_count
+
+        best_index = int(np.argmax(scores))
+        best = self._make_block(
+            ref_tensor.name,
+            block_start + best_index,
+            scales,
+            max_abs_ref,
+            rms_ref,
+            max_abs_error,
+            scores,
+            best_index,
+        )
+        layer, sublayer, _ = split_layer_sublayer(ref_tensor.name)
+        key = (layer, sublayer)
+        self._sublayers.setdefault(key, SublayerBlockOutlierAccumulator()).update(
+            block_count,
+            float(np.sum(scores, dtype=np.float64)),
+            float(np.sum(max_abs_error, dtype=np.float64)),
+            best,
+        )
+
+        if self.top <= 0:
+            return
+
+        candidate_count = min(self.top, block_count)
+        if candidate_count == block_count:
+            candidate_indexes = np.arange(block_count)
+        else:
+            candidate_indexes = np.argpartition(scores, -candidate_count)[-candidate_count:]
+
+        for raw_index in candidate_indexes:
+            i = int(raw_index)
+            block = self._make_block(
+                ref_tensor.name,
+                block_start + i,
+                scales,
+                max_abs_ref,
+                rms_ref,
+                max_abs_error,
+                scores,
+                i,
+            )
+            item = (block.outlier_score, self._counter, block)
+            self._counter += 1
+            if len(self._top_heap) < self.top:
+                heapq.heappush(self._top_heap, item)
+            elif item[0] > self._top_heap[0][0]:
+                heapq.heapreplace(self._top_heap, item)
+
+    @staticmethod
+    def _make_block(
+        tensor_name: str,
+        block_index: int,
+        scales: np.ndarray,
+        max_abs_ref: np.ndarray,
+        rms_ref: np.ndarray,
+        max_abs_error: np.ndarray,
+        scores: np.ndarray,
+        i: int,
+    ) -> BlockOutlierInfo:
+        return BlockOutlierInfo(
+            tensor_name=tensor_name,
+            block_index=block_index,
+            scale=float(scales[i]),
+            max_abs_ref=float(max_abs_ref[i]),
+            rms_ref=float(rms_ref[i]),
+            max_abs_error=float(max_abs_error[i]),
+            outlier_score=float(scores[i]),
+        )
+
+    def worst_block_rows(self) -> list[dict[str, Any]]:
+        blocks = [item[2] for item in self._top_heap]
+        blocks.sort(key=lambda b: -b.outlier_score)
+        return [_block_outlier_to_row(block) for block in blocks]
+
+    def sublayer_summary_rows(self) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        for (layer, sublayer), acc in self._sublayers.items():
+            if acc.total_q8_blocks == 0 or acc.best is None:
+                continue
+            best = acc.best
+            rows.append({
+                "layer": layer,
+                "sublayer": sublayer,
+                "tensor_name": best.tensor_name,
+                "total_q8_blocks": acc.total_q8_blocks,
+                "mean_outlier_score": acc.sum_outlier_score / acc.total_q8_blocks,
+                "max_outlier_score": best.outlier_score,
+                "worst_block_index": best.block_index,
+                "worst_block_global_index": best.global_element_index,
+                "worst_block_scale": best.scale,
+                "worst_block_max_abs_ref": best.max_abs_ref,
+                "worst_block_rms_ref": best.rms_ref,
+                "worst_block_max_abs_error": best.max_abs_error,
+                "mean_max_abs_error": acc.sum_max_abs_error / acc.total_q8_blocks,
+            })
+        rows.sort(key=lambda r: -float(r["max_outlier_score"]))
+        return rows
+
+
 def compare_tensor(
     ref_mm: mmap.mmap,
     quant_mm: mmap.mmap,
@@ -592,11 +749,14 @@ def compare_tensor(
     chunk_values: int,
     progress: Any | None,
     collect_block_outliers: bool = False,
+    block_outlier_analyzer: Q8BlockOutlierAnalyzer | None = None,
 ) -> tuple[RunningStats, list[BlockOutlierInfo]]:
     """Compare a tensor and optionally collect per-block outlier info for Q8_0 tensors.
 
-    Returns (stats, block_outliers) where block_outliers is populated only when
-    collect_block_outliers=True and the candidate tensor is Q8_0.
+    Returns (stats, block_outliers). For the CLI path, block_outlier_analyzer
+    streams Q8_0 block analysis without storing every block. If callers use the
+    older collect_block_outliers=True API without an analyzer, the full list is
+    still returned for compatibility.
     """
     stats = RunningStats()
     block_outliers: list[BlockOutlierInfo] = []
@@ -615,10 +775,15 @@ def compare_tensor(
             stats.update(ref, quant, start)
 
             if collect_block_outliers and quant_tensor.ggml_type == GGML_Q8_0:
-                _collect_q8_0_block_outliers(
-                    block_outliers, ref_tensor, quant_tensor,
-                    ref, quant, ref_mm, quant_mm, block_start, block_count,
-                )
+                if block_outlier_analyzer is not None:
+                    block_outlier_analyzer.update(
+                        ref_tensor, quant_tensor, ref, quant, quant_mm, block_start, block_count
+                    )
+                else:
+                    _collect_q8_0_block_outliers(
+                        block_outliers, ref_tensor, quant_tensor,
+                        ref, quant, quant_mm, block_start, block_count,
+                    )
 
             if progress is not None:
                 progress.update(count)
@@ -640,29 +805,25 @@ def _collect_q8_0_block_outliers(
     quant_tensor: TensorInfo,
     ref: np.ndarray,
     quant: np.ndarray,
-    ref_mm: mmap.mmap,
     quant_mm: mmap.mmap,
     block_start: int,
     block_count: int,
 ) -> None:
-    """Collect per-block outlier metrics by re-reading raw Q8_0 block headers."""
-    # Read raw Q8_0 block headers to get the scale for each block
+    """Compatibility path that materializes per-block outlier objects in block order."""
     byte_offset = quant_tensor.data_offset + block_start * Q8_0_DTYPE.itemsize
     raw_blocks = np.frombuffer(quant_mm, dtype=Q8_0_DTYPE, count=block_count, offset=byte_offset)
     scales = raw_blocks["d"].astype(np.float32)
 
-    # Reshape dequantized ref and error for per-block analysis
-    ref_reshaped = ref.reshape(-1, Q8_0_BLOCK_SIZE)
-    error = np.abs(np.subtract(quant, ref, dtype=np.float32)).reshape(-1, Q8_0_BLOCK_SIZE)
+    ref_blocks = ref.reshape(block_count, Q8_0_BLOCK_SIZE)
+    quant_blocks = quant.reshape(block_count, Q8_0_BLOCK_SIZE)
+    max_abs_ref = np.max(np.abs(ref_blocks), axis=1)
+    ref_sq_sum = np.einsum("ij,ij->i", ref_blocks, ref_blocks, dtype=np.float64)
+    rms_ref = np.sqrt(ref_sq_sum / Q8_0_BLOCK_SIZE)
+    error = np.subtract(quant_blocks, ref_blocks, dtype=np.float32)
+    max_abs_error = np.max(np.abs(error), axis=1)
+    scores = max_abs_ref / np.maximum(rms_ref, 1e-30)
 
-    # Per-block metrics
-    max_abs_ref = np.max(np.abs(ref_reshaped), axis=1)
-    rms_ref = np.sqrt(np.mean(np.square(ref_reshaped, dtype=np.float64), axis=1))
-    max_abs_error = np.max(error, axis=1)
-
-    eps = 1e-30
     for i in range(block_count):
-        score = float(max_abs_ref[i] / max(rms_ref[i], eps))
         block_outliers.append(BlockOutlierInfo(
             tensor_name=ref_tensor.name,
             block_index=block_start + i,
@@ -670,7 +831,7 @@ def _collect_q8_0_block_outliers(
             max_abs_ref=float(max_abs_ref[i]),
             rms_ref=float(rms_ref[i]),
             max_abs_error=float(max_abs_error[i]),
-            outlier_score=score,
+            outlier_score=float(scores[i]),
         ))
 
 
@@ -750,54 +911,12 @@ def aggregate_rows(rows: Iterable[dict[str, Any]], key_field: str) -> list[dict[
 
 
 def analyze_block_outliers(
-    all_outliers: list[BlockOutlierInfo],
-    top: int,
+    analyzer: Q8BlockOutlierAnalyzer,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Analyze Q8_0 block outliers and produce per-block and per-sublayer summaries.
-
-    Returns (worst_blocks, sublayer_summaries).
-    - worst_blocks: top-N individual blocks ranked by outlier_score descending.
-    - sublayer_summaries: aggregated by (layer, sublayer) with worst-block info.
-    """
-    if not all_outliers:
+    """Return Q8_0 block outlier outputs from the streaming analyzer."""
+    if analyzer.total_blocks == 0:
         return [], []
-
-    # Sort all outliers by score descending
-    sorted_outliers = sorted(all_outliers, key=lambda b: -b.outlier_score)
-    worst_blocks = [
-        _block_outlier_to_row(b) for b in sorted_outliers[:top]
-    ]
-
-    # Group by (layer, sublayer)
-    grouped: dict[tuple[str, str], list[BlockOutlierInfo]] = {}
-    for b in all_outliers:
-        layer, sublayer, _ = split_layer_sublayer(b.tensor_name)
-        key = (layer, sublayer)
-        grouped.setdefault(key, []).append(b)
-
-    sublayer_summaries: list[dict[str, Any]] = []
-    for (layer, sublayer), blocks in grouped.items():
-        scores = [b.outlier_score for b in blocks]
-        max_abs_errors = [b.max_abs_error for b in blocks]
-        best = max(blocks, key=lambda b: b.outlier_score)
-        sublayer_summaries.append({
-            "layer": layer,
-            "sublayer": sublayer,
-            "tensor_name": best.tensor_name,
-            "total_q8_blocks": len(blocks),
-            "mean_outlier_score": sum(scores) / len(scores),
-            "max_outlier_score": best.outlier_score,
-            "worst_block_index": best.block_index,
-            "worst_block_global_index": best.global_element_index,
-            "worst_block_scale": best.scale,
-            "worst_block_max_abs_ref": best.max_abs_ref,
-            "worst_block_rms_ref": best.rms_ref,
-            "worst_block_max_abs_error": best.max_abs_error,
-            "mean_max_abs_error": sum(max_abs_errors) / len(max_abs_errors) if max_abs_errors else 0.0,
-        })
-
-    sublayer_summaries.sort(key=lambda r: -float(r["max_outlier_score"]))
-    return worst_blocks, sublayer_summaries
+    return analyzer.worst_block_rows(), analyzer.sublayer_summary_rows()
 
 
 def _block_outlier_to_row(b: BlockOutlierInfo) -> dict[str, Any]:
@@ -831,7 +950,7 @@ BLOCK_OUTLIER_CSV_FIELDS = [
     "outlier_score",
 ]
 
-SUBBLAYER_BLOCK_OUTLIER_CSV_FIELDS = [
+SUBLAYER_BLOCK_OUTLIER_CSV_FIELDS = [
     "layer",
     "sublayer",
     "tensor_name",
@@ -1493,7 +1612,7 @@ def main(argv: list[str] | None = None) -> int:
         progress = tqdm(total=total_elements, unit="el", unit_scale=True, desc="Comparing")
 
     tensor_rows: list[dict[str, Any]] = []
-    all_block_outliers: list[BlockOutlierInfo] = []
+    block_outlier_analyzer = Q8BlockOutlierAnalyzer(args.block_outlier_top)
     ref_handles: list[Any] = []
     quant_handles: list[Any] = []
     ref_mmaps: list[mmap.mmap] = []
@@ -1515,11 +1634,11 @@ def main(argv: list[str] | None = None) -> int:
                 args.chunk_values,
                 progress,
                 collect_block_outliers=True,
+                block_outlier_analyzer=block_outlier_analyzer,
             )
             row = make_tensor_row(ref_tensor, quant_tensor, stats)
             row.update(stats_private_fields(stats))
             tensor_rows.append(row)
-            all_block_outliers.extend(block_outliers)
     finally:
         if progress is not None:
             progress.close()
@@ -1531,9 +1650,7 @@ def main(argv: list[str] | None = None) -> int:
     sublayer_rows = aggregate_rows(tensor_rows, "sublayer")
 
     # Analyze Q8_0 block outliers
-    worst_blocks, sublayer_block_outliers = analyze_block_outliers(
-        all_block_outliers, args.block_outlier_top
-    )
+    worst_blocks, sublayer_block_outliers = analyze_block_outliers(block_outlier_analyzer)
 
     elapsed_s = time.perf_counter() - start_time
 
@@ -1566,7 +1683,7 @@ def main(argv: list[str] | None = None) -> int:
         "layer_metrics": layer_rows,
         "sublayer_metrics": sublayer_rows,
         "skipped": skipped,
-        "q8_0_blocks_analyzed": len(all_block_outliers),
+        "q8_0_blocks_analyzed": block_outlier_analyzer.total_blocks,
     }
     (out_dir / "metrics.json").write_text(
         json.dumps(json_safe(summary), indent=2, sort_keys=True),
@@ -1593,7 +1710,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Wrote {out_dir / 'layer_metrics.csv'}")
     print(f"Wrote {out_dir / 'sublayer_metrics.csv'}")
     if worst_blocks:
-        print(f"Wrote {out_dir / 'block_outliers.csv'} ({len(all_block_outliers):,} Q8_0 blocks analyzed)")
+        print(f"Wrote {out_dir / 'block_outliers.csv'} ({block_outlier_analyzer.total_blocks:,} Q8_0 blocks analyzed)")
     if sublayer_block_outliers:
         print(f"Wrote {out_dir / 'sublayer_block_outliers.csv'}")
     print(f"Wrote {out_dir / 'metrics.json'}")
