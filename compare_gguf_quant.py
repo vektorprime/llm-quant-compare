@@ -10,6 +10,8 @@ loaded into RAM at once.
 from __future__ import annotations
 
 import argparse
+import atexit
+import concurrent.futures
 import csv
 import heapq
 import json
@@ -682,12 +684,7 @@ class Q8BlockOutlierAnalyzer:
                 scores,
                 i,
             )
-            item = (block.outlier_score, self._counter, block)
-            self._counter += 1
-            if len(self._top_heap) < self.top:
-                heapq.heappush(self._top_heap, item)
-            elif item[0] > self._top_heap[0][0]:
-                heapq.heapreplace(self._top_heap, item)
+            self._push_top_block(block)
 
     @staticmethod
     def _make_block(
@@ -709,6 +706,30 @@ class Q8BlockOutlierAnalyzer:
             max_abs_error=float(max_abs_error[i]),
             outlier_score=float(scores[i]),
         )
+
+    def _push_top_block(self, block: BlockOutlierInfo) -> None:
+        if self.top <= 0:
+            return
+        item = (block.outlier_score, self._counter, block)
+        self._counter += 1
+        if len(self._top_heap) < self.top:
+            heapq.heappush(self._top_heap, item)
+        elif item[0] > self._top_heap[0][0]:
+            heapq.heapreplace(self._top_heap, item)
+
+    def merge(self, other: "Q8BlockOutlierAnalyzer") -> None:
+        self.total_blocks += other.total_blocks
+        for _, _, block in other._top_heap:
+            self._push_top_block(block)
+        for key, other_acc in other._sublayers.items():
+            if other_acc.total_q8_blocks == 0 or other_acc.best is None:
+                continue
+            self._sublayers.setdefault(key, SublayerBlockOutlierAccumulator()).update(
+                other_acc.total_q8_blocks,
+                other_acc.sum_outlier_score,
+                other_acc.sum_max_abs_error,
+                other_acc.best,
+            )
 
     def worst_block_rows(self) -> list[dict[str, Any]]:
         blocks = [item[2] for item in self._top_heap]
@@ -917,6 +938,179 @@ def analyze_block_outliers(
     if analyzer.total_blocks == 0:
         return [], []
     return analyzer.worst_block_rows(), analyzer.sublayer_summary_rows()
+
+
+def resolve_worker_count(requested_workers: int, selected_tensor_count: int) -> int:
+    """Resolve --workers; 0 means auto based on CPU count.
+
+    Auto uses roughly one worker per physical core on common SMT systems by
+    using half of logical CPUs. Users can still override this with --workers.
+    """
+    if selected_tensor_count <= 1:
+        return 1
+    cpu_count = os.cpu_count() or 1
+    if requested_workers < 0:
+        raise ValueError("--workers must be >= 0")
+    if requested_workers == 0:
+        if cpu_count <= 2:
+            return 1
+        workers = max(1, cpu_count // 2)
+    else:
+        workers = requested_workers
+    return max(1, min(workers, selected_tensor_count))
+
+
+_WORKER_REF: GGUFCollection | None = None
+_WORKER_QUANT: GGUFCollection | None = None
+_WORKER_REF_BY_NAME: dict[str, TensorInfo] = {}
+_WORKER_QUANT_BY_NAME: dict[str, TensorInfo] = {}
+_WORKER_REF_HANDLES: list[Any] = []
+_WORKER_QUANT_HANDLES: list[Any] = []
+_WORKER_REF_MMAPS: list[mmap.mmap] = []
+_WORKER_QUANT_MMAPS: list[mmap.mmap] = []
+_WORKER_REF_MMAP_BY_PATH: dict[Path, mmap.mmap] = {}
+_WORKER_QUANT_MMAP_BY_PATH: dict[Path, mmap.mmap] = {}
+_WORKER_CHUNK_BLOCKS = 0
+_WORKER_CHUNK_VALUES = 0
+_WORKER_BLOCK_OUTLIER_TOP = 0
+
+
+def _close_compare_worker() -> None:
+    global _WORKER_REF_HANDLES, _WORKER_QUANT_HANDLES
+    global _WORKER_REF_MMAPS, _WORKER_QUANT_MMAPS
+    close_mmaps(_WORKER_REF_HANDLES, _WORKER_REF_MMAPS)
+    close_mmaps(_WORKER_QUANT_HANDLES, _WORKER_QUANT_MMAPS)
+    _WORKER_REF_HANDLES = []
+    _WORKER_QUANT_HANDLES = []
+    _WORKER_REF_MMAPS = []
+    _WORKER_QUANT_MMAPS = []
+
+
+def _init_compare_worker(
+    ref: GGUFCollection,
+    quant: GGUFCollection,
+    chunk_blocks: int,
+    chunk_values: int,
+    block_outlier_top: int,
+) -> None:
+    """Open per-process mmap handles once and reuse them for tensor tasks."""
+    global _WORKER_REF, _WORKER_QUANT, _WORKER_REF_BY_NAME, _WORKER_QUANT_BY_NAME
+    global _WORKER_REF_HANDLES, _WORKER_QUANT_HANDLES
+    global _WORKER_REF_MMAPS, _WORKER_QUANT_MMAPS
+    global _WORKER_REF_MMAP_BY_PATH, _WORKER_QUANT_MMAP_BY_PATH
+    global _WORKER_CHUNK_BLOCKS, _WORKER_CHUNK_VALUES, _WORKER_BLOCK_OUTLIER_TOP
+
+    os.environ.setdefault("OMP_NUM_THREADS", "1")
+    os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+    os.environ.setdefault("MKL_NUM_THREADS", "1")
+    os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+
+    _WORKER_REF = ref
+    _WORKER_QUANT = quant
+    _WORKER_REF_BY_NAME = ref.tensors_by_name
+    _WORKER_QUANT_BY_NAME = quant.tensors_by_name
+    _WORKER_CHUNK_BLOCKS = chunk_blocks
+    _WORKER_CHUNK_VALUES = chunk_values
+    _WORKER_BLOCK_OUTLIER_TOP = block_outlier_top
+
+    _WORKER_REF_HANDLES, _WORKER_REF_MMAPS = open_mmaps(ref.paths)
+    _WORKER_QUANT_HANDLES, _WORKER_QUANT_MMAPS = open_mmaps(quant.paths)
+    _WORKER_REF_MMAP_BY_PATH = dict(zip(ref.paths, _WORKER_REF_MMAPS))
+    _WORKER_QUANT_MMAP_BY_PATH = dict(zip(quant.paths, _WORKER_QUANT_MMAPS))
+    atexit.register(_close_compare_worker)
+
+
+def _compare_tensor_worker(name: str) -> tuple[str, dict[str, Any], Q8BlockOutlierAnalyzer]:
+    ref_tensor = _WORKER_REF_BY_NAME[name]
+    quant_tensor = _WORKER_QUANT_BY_NAME[name]
+    analyzer = Q8BlockOutlierAnalyzer(_WORKER_BLOCK_OUTLIER_TOP)
+    stats, _ = compare_tensor(
+        _WORKER_REF_MMAP_BY_PATH[ref_tensor.source_path],
+        _WORKER_QUANT_MMAP_BY_PATH[quant_tensor.source_path],
+        ref_tensor,
+        quant_tensor,
+        _WORKER_CHUNK_BLOCKS,
+        _WORKER_CHUNK_VALUES,
+        None,
+        collect_block_outliers=True,
+        block_outlier_analyzer=analyzer,
+    )
+    row = make_tensor_row(ref_tensor, quant_tensor, stats)
+    row.update(stats_private_fields(stats))
+    return name, row, analyzer
+
+
+def compare_selected_tensors_serial(
+    selected_names: list[str],
+    ref: GGUFCollection,
+    quant: GGUFCollection,
+    ref_by_name: dict[str, TensorInfo],
+    quant_by_name: dict[str, TensorInfo],
+    chunk_blocks: int,
+    chunk_values: int,
+    block_outlier_top: int,
+    progress: Any | None,
+) -> tuple[list[dict[str, Any]], Q8BlockOutlierAnalyzer]:
+    tensor_rows: list[dict[str, Any]] = []
+    block_outlier_analyzer = Q8BlockOutlierAnalyzer(block_outlier_top)
+    ref_handles: list[Any] = []
+    quant_handles: list[Any] = []
+    ref_mmaps: list[mmap.mmap] = []
+    quant_mmaps: list[mmap.mmap] = []
+    try:
+        ref_handles, ref_mmaps = open_mmaps(ref.paths)
+        quant_handles, quant_mmaps = open_mmaps(quant.paths)
+        ref_mmap_by_path = dict(zip(ref.paths, ref_mmaps))
+        quant_mmap_by_path = dict(zip(quant.paths, quant_mmaps))
+        for name in selected_names:
+            ref_tensor = ref_by_name[name]
+            quant_tensor = quant_by_name[name]
+            stats, _ = compare_tensor(
+                ref_mmap_by_path[ref_tensor.source_path],
+                quant_mmap_by_path[quant_tensor.source_path],
+                ref_tensor,
+                quant_tensor,
+                chunk_blocks,
+                chunk_values,
+                progress,
+                collect_block_outliers=True,
+                block_outlier_analyzer=block_outlier_analyzer,
+            )
+            row = make_tensor_row(ref_tensor, quant_tensor, stats)
+            row.update(stats_private_fields(stats))
+            tensor_rows.append(row)
+    finally:
+        close_mmaps(ref_handles, ref_mmaps)
+        close_mmaps(quant_handles, quant_mmaps)
+
+    return tensor_rows, block_outlier_analyzer
+
+
+def compare_selected_tensors_parallel(
+    selected_names: list[str],
+    ref: GGUFCollection,
+    quant: GGUFCollection,
+    workers: int,
+    chunk_blocks: int,
+    chunk_values: int,
+    block_outlier_top: int,
+    progress: Any | None,
+) -> tuple[list[dict[str, Any]], Q8BlockOutlierAnalyzer]:
+    tensor_rows: list[dict[str, Any]] = []
+    block_outlier_analyzer = Q8BlockOutlierAnalyzer(block_outlier_top)
+    with concurrent.futures.ProcessPoolExecutor(
+        max_workers=workers,
+        initializer=_init_compare_worker,
+        initargs=(ref, quant, chunk_blocks, chunk_values, block_outlier_top),
+    ) as executor:
+        futures = {executor.submit(_compare_tensor_worker, name): name for name in selected_names}
+        for future in concurrent.futures.as_completed(futures):
+            name, row, analyzer = future.result()
+            tensor_rows.append(row)
+            block_outlier_analyzer.merge(analyzer)
+            if progress is not None:
+                progress.update(int(row["elements"]))
+    return tensor_rows, block_outlier_analyzer
 
 
 def _block_outlier_to_row(b: BlockOutlierInfo) -> dict[str, Any]:
@@ -1184,6 +1378,7 @@ def write_markdown_report(
     text.append(f"- Candidate files: {len(quant.files)}\n")
     text.append(f"- Compared tensors: {len(tensor_rows)}\n")
     text.append(f"- Compared elements: {total_metrics['elements']:,}\n")
+    text.append(f"- Workers: {getattr(args, 'resolved_workers', getattr(args, 'workers', 1))}\n")
     text.append(f"- Elapsed: {elapsed_s:.2f} seconds\n")
     text.append(f"- Reference tensor types: `{json.dumps(type_counts(ref), sort_keys=True)}`\n")
     text.append(f"- Candidate tensor types: `{json.dumps(type_counts(quant), sort_keys=True)}`\n")
@@ -1527,6 +1722,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--exclude", help="Skip tensor names matching this regex.")
     parser.add_argument("--top", default=25, type=int, help="Rows shown in Markdown top lists.")
     parser.add_argument("--max-tensors", type=int, help="Debug/validation limit after filtering.")
+    parser.add_argument(
+        "--workers",
+        default=0,
+        type=int,
+        help=(
+            "Tensor comparison worker processes. Use 0 to auto-select based on CPU count "
+            "(roughly half of logical CPUs, capped by selected tensors). Use 1 for serial mode."
+        ),
+    )
     parser.add_argument("--no-progress", action="store_true", help="Disable tqdm progress output.")
     parser.add_argument(
         "--show-zero-error",
@@ -1606,44 +1810,42 @@ def main(argv: list[str] | None = None) -> int:
     model_name = infer_model_name(ref, quant)
     out_dir = create_run_output_dir(args.out_dir, model_name, run_started_at)
 
+    worker_count = resolve_worker_count(args.workers, len(selected_names))
+    args.resolved_workers = worker_count
+
     total_elements = sum(ref_by_name[name].n_elements for name in selected_names)
     progress = None
     if not args.no_progress and tqdm is not None:
-        progress = tqdm(total=total_elements, unit="el", unit_scale=True, desc="Comparing")
+        desc = "Comparing" if worker_count == 1 else f"Comparing ({worker_count} workers)"
+        progress = tqdm(total=total_elements, unit="el", unit_scale=True, desc=desc)
 
-    tensor_rows: list[dict[str, Any]] = []
-    block_outlier_analyzer = Q8BlockOutlierAnalyzer(args.block_outlier_top)
-    ref_handles: list[Any] = []
-    quant_handles: list[Any] = []
-    ref_mmaps: list[mmap.mmap] = []
-    quant_mmaps: list[mmap.mmap] = []
     try:
-        ref_handles, ref_mmaps = open_mmaps(ref.paths)
-        quant_handles, quant_mmaps = open_mmaps(quant.paths)
-        ref_mmap_by_path = dict(zip(ref.paths, ref_mmaps))
-        quant_mmap_by_path = dict(zip(quant.paths, quant_mmaps))
-        for name in selected_names:
-            ref_tensor = ref_by_name[name]
-            quant_tensor = quant_by_name[name]
-            stats, block_outliers = compare_tensor(
-                ref_mmap_by_path[ref_tensor.source_path],
-                quant_mmap_by_path[quant_tensor.source_path],
-                ref_tensor,
-                quant_tensor,
+        if worker_count == 1:
+            tensor_rows, block_outlier_analyzer = compare_selected_tensors_serial(
+                selected_names,
+                ref,
+                quant,
+                ref_by_name,
+                quant_by_name,
                 args.chunk_blocks,
                 args.chunk_values,
+                args.block_outlier_top,
                 progress,
-                collect_block_outliers=True,
-                block_outlier_analyzer=block_outlier_analyzer,
             )
-            row = make_tensor_row(ref_tensor, quant_tensor, stats)
-            row.update(stats_private_fields(stats))
-            tensor_rows.append(row)
+        else:
+            tensor_rows, block_outlier_analyzer = compare_selected_tensors_parallel(
+                selected_names,
+                ref,
+                quant,
+                worker_count,
+                args.chunk_blocks,
+                args.chunk_values,
+                args.block_outlier_top,
+                progress,
+            )
     finally:
         if progress is not None:
             progress.close()
-        close_mmaps(ref_handles, ref_mmaps)
-        close_mmaps(quant_handles, quant_mmaps)
 
     tensor_rows.sort(key=lambda r: (-float(r["relative_l2_error"]), str(r["name"])))
     layer_rows = aggregate_rows(tensor_rows, "layer")
@@ -1678,6 +1880,7 @@ def main(argv: list[str] | None = None) -> int:
         "candidate_metadata": quant.metadata,
         "compared_tensors": len(tensor_rows),
         "compared_elements": sum(int(row["elements"]) for row in tensor_rows),
+        "workers": worker_count,
         "elapsed_seconds": elapsed_s,
         "tensor_metrics": public_tensor_rows,
         "layer_metrics": layer_rows,
@@ -1703,7 +1906,7 @@ def main(argv: list[str] | None = None) -> int:
         sublayer_block_outlier_rows=sublayer_block_outliers if sublayer_block_outliers else None,
     )
 
-    print(f"Compared {len(tensor_rows)} tensors ({summary['compared_elements']:,} elements)")
+    print(f"Compared {len(tensor_rows)} tensors ({summary['compared_elements']:,} elements) with {worker_count} worker(s)")
     print(f"Output directory: {out_dir}")
     print(f"Wrote {out_dir / 'report.md'}")
     print(f"Wrote {out_dir / 'tensor_metrics.csv'}")
