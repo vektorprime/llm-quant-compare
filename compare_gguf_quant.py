@@ -2,9 +2,9 @@
 """Compare value drift between a reference GGUF and a quantized GGUF.
 
 This tool is intentionally self-contained: it parses the GGUF header directly,
-memory maps tensor bytes, dequantizes Q8_0 blocks as ``scale * int8`` values,
-and streams tensor chunks through NumPy so multi-GB models do not need to be
-loaded into RAM at once.
+memory maps tensor bytes, dequantizes Q8_0 (32-value blocks) and Q8_16B (16-value
+blocks) as ``scale * int8`` values, and streams tensor chunks through NumPy so
+multi-GB models do not need to be loaded into RAM at once.
 """
 
 from __future__ import annotations
@@ -103,6 +103,7 @@ GGML_TYPE_NAMES = {
     34: "TQ1_0",
     35: "TQ2_0",
     36: "MXFP4",
+    42: "Q8_16B",
 }
 
 GGML_F32 = 0
@@ -114,6 +115,7 @@ GGML_I32 = 26
 GGML_I64 = 27
 GGML_F64 = 28
 GGML_BF16 = 30
+GGML_Q8_16B = 42
 
 DENSE_NUMPY_TYPES = {
     GGML_F32: np.dtype("<f4"),
@@ -129,7 +131,10 @@ DENSE_NUMPY_TYPES = {
 Q8_0_BLOCK_SIZE = 32
 Q8_0_DTYPE = np.dtype([("d", "<f2"), ("qs", "i1", (Q8_0_BLOCK_SIZE,))])
 
-SUPPORTED_TYPES = set(DENSE_NUMPY_TYPES) | {GGML_Q8_0}
+Q8_16B_BLOCK_SIZE = 16
+Q8_16B_DTYPE = np.dtype([("d", "<f2"), ("qs", "i1", (Q8_16B_BLOCK_SIZE,))])
+
+SUPPORTED_TYPES = set(DENSE_NUMPY_TYPES) | {GGML_Q8_0, GGML_Q8_16B}
 
 SELECTED_METADATA_KEYS = {
     "general.architecture",
@@ -293,6 +298,10 @@ def tensor_nbytes(tensor: TensorInfo) -> int:
         if n % Q8_0_BLOCK_SIZE:
             raise ValueError(f"{tensor.name}: Q8_0 element count {n} is not divisible by 32")
         return (n // Q8_0_BLOCK_SIZE) * Q8_0_DTYPE.itemsize
+    if tensor.ggml_type == GGML_Q8_16B:
+        if n % Q8_16B_BLOCK_SIZE:
+            raise ValueError(f"{tensor.name}: Q8_16B element count {n} is not divisible by 16")
+        return (n // Q8_16B_BLOCK_SIZE) * Q8_16B_DTYPE.itemsize
     if tensor.ggml_type in DENSE_NUMPY_TYPES:
         return n * DENSE_NUMPY_TYPES[tensor.ggml_type].itemsize
     raise ValueError(f"{tensor.name}: unsupported tensor type {tensor.type_name}")
@@ -409,6 +418,14 @@ def dequant_q8_0(mm: mmap.mmap, tensor: TensorInfo, block_start: int, block_coun
     return values.reshape(-1)
 
 
+def dequant_q8_16b(mm: mmap.mmap, tensor: TensorInfo, block_start: int, block_count: int) -> np.ndarray:
+    byte_offset = tensor.data_offset + block_start * Q8_16B_DTYPE.itemsize
+    blocks = np.frombuffer(mm, dtype=Q8_16B_DTYPE, count=block_count, offset=byte_offset)
+    values = blocks["qs"].astype(np.float32)
+    values *= blocks["d"].astype(np.float32).reshape(-1, 1)
+    return values.reshape(-1)
+
+
 def read_dense_values(mm: mmap.mmap, tensor: TensorInfo, start: int, count: int) -> np.ndarray:
     dtype = DENSE_NUMPY_TYPES[tensor.ggml_type]
     byte_offset = tensor.data_offset + start * dtype.itemsize
@@ -430,6 +447,10 @@ def read_values(mm: mmap.mmap, tensor: TensorInfo, start: int, count: int) -> np
         if start % Q8_0_BLOCK_SIZE or count % Q8_0_BLOCK_SIZE:
             raise ValueError(f"{tensor.name}: Q8_0 reads must be 32-value aligned")
         return dequant_q8_0(mm, tensor, start // Q8_0_BLOCK_SIZE, count // Q8_0_BLOCK_SIZE)
+    if tensor.ggml_type == GGML_Q8_16B:
+        if start % Q8_16B_BLOCK_SIZE or count % Q8_16B_BLOCK_SIZE:
+            raise ValueError(f"{tensor.name}: Q8_16B reads must be 16-value aligned")
+        return dequant_q8_16b(mm, tensor, start // Q8_16B_BLOCK_SIZE, count // Q8_16B_BLOCK_SIZE)
     return read_dense_values(mm, tensor, start, count)
 
 
@@ -891,7 +912,7 @@ def compare_tensor(
 
     if quant_tensor.ggml_type == GGML_Q8_0 or ref_tensor.ggml_type == GGML_Q8_0:
         if n % Q8_0_BLOCK_SIZE:
-            raise ValueError(f"{ref_tensor.name}: element count {n} is not divisible by 32")
+            raise ValueError(f"{ref_tensor.name}: element count {n} is not divisible by {Q8_0_BLOCK_SIZE}")
         total_blocks = n // Q8_0_BLOCK_SIZE
         for block_start in range(0, total_blocks, chunk_blocks):
             block_count = min(chunk_blocks, total_blocks - block_start)
@@ -911,6 +932,20 @@ def compare_tensor(
                         block_outliers, ref_tensor, quant_tensor,
                         ref, quant, quant_mm, block_start, block_count,
                     )
+
+            if progress is not None:
+                progress.update(count)
+    elif quant_tensor.ggml_type == GGML_Q8_16B or ref_tensor.ggml_type == GGML_Q8_16B:
+        if n % Q8_16B_BLOCK_SIZE:
+            raise ValueError(f"{ref_tensor.name}: element count {n} is not divisible by {Q8_16B_BLOCK_SIZE}")
+        total_blocks = n // Q8_16B_BLOCK_SIZE
+        for block_start in range(0, total_blocks, chunk_blocks):
+            block_count = min(chunk_blocks, total_blocks - block_start)
+            start = block_start * Q8_16B_BLOCK_SIZE
+            count = block_count * Q8_16B_BLOCK_SIZE
+            ref = read_values(ref_mm, ref_tensor, start, count)
+            quant = read_values(quant_mm, quant_tensor, start, count)
+            stats.update(ref, quant, start)
 
             if progress is not None:
                 progress.update(count)
@@ -1430,7 +1465,7 @@ def metric_reference_markdown() -> str:
 Notation used below:
 
 - `ref`: the reference/native value from the BF16/F32 GGUF.
-- `quant`: the candidate value after dequantization. For Q8_0 this is `float16_scale * int8_weight` for each value in a 32-value block.
+- `quant`: the candidate value after dequantization. For Q8_0 this is `float16_scale * int8_weight` for each value in a 32-value block. For Q8_16B the same formula applies with 16-value blocks.
 - `error`: `quant - ref`.
 - `n`: number of values included in that tensor, layer, or sublayer group.
 
@@ -1449,7 +1484,7 @@ Layer and sublayer rows are computed by aggregating the underlying sums across a
 | `quant_file` | Candidate shard containing this tensor. Useful for split GGUFs. | Source path where the matched candidate tensor was found. |
 | `elements` | Number of scalar values compared. | Product of tensor dimensions, or sum of elements for grouped rows. |
 | `ref_bytes` | On-disk bytes used by the reference tensor(s). | Computed from tensor type and element count. |
-| `quant_bytes` | On-disk bytes used by the candidate tensor(s). | Computed from tensor type and element count. Q8_0 uses 34 bytes per 32 values. |
+| `quant_bytes` | On-disk bytes used by the candidate tensor(s). | Computed from tensor type and element count. Q8_0 uses 34 bytes per 32 values. Q8_16B uses 18 bytes per 16 values. |
 | `compression_ratio` | Storage reduction from reference to candidate. Higher is smaller candidate storage. | `ref_bytes / quant_bytes`. |
 | `mean_ref` | Average reference value. | `sum(ref) / n`. |
 | `mean_quant` | Average candidate value after dequantization. | `sum(quant) / n`. |
@@ -1542,6 +1577,7 @@ def write_markdown_report(
         text.append(f"- Skipped tensor rows hidden from this report: {len(skipped)}\n")
     text.append("\n")
     text.append("Q8_0 tensors are dequantized as `final_weight = float16_scale * int8_weight` for every 32-value block before comparison.\n")
+    text.append("Q8_16B tensors use the same formula but with 16-value blocks.\n")
     text.append("\n")
     text.append("## Overall\n\n")
     text.append(f"- Relative L2 error: `{fmt_float(total_metrics['relative_l2_error'])}`\n")
