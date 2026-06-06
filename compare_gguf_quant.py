@@ -576,19 +576,21 @@ class RunningStats:
 
 @dataclass
 class BlockOutlierInfo:
-    """Per-Q8_0-block statistics used to detect outlier-driven scale divergence."""
+    """Per-block statistics used to detect outlier-driven scale divergence."""
     tensor_name: str
     block_index: int          # 0-based block index within the tensor
     scale: float              # the float16 scale d (dequantized to float32)
-    max_abs_ref: float        # max |ref| value in this 32-value block
+    max_abs_ref: float        # max |ref| value in this block
     rms_ref: float            # RMS of ref values in this block
     max_abs_error: float      # max |quant - ref| in this block
     outlier_score: float      # max_abs_ref / rms_ref  (higher = more extreme outlier)
+    block_size: int = Q8_0_BLOCK_SIZE
+    block_type: str = "Q8_0"
 
     @property
     def global_element_index(self) -> int:
         """Flattened element index where this block starts."""
-        return self.block_index * Q8_0_BLOCK_SIZE
+        return self.block_index * self.block_size
 
 
 def split_layer_sublayer(name: str) -> tuple[str, str, int | None]:
@@ -731,9 +733,9 @@ class SublayerBlockOutlierAccumulator:
 
 
 class Q8BlockOutlierAnalyzer:
-    """Streaming top-N and grouped Q8_0 block outlier analysis.
+    """Streaming top-N and grouped block outlier analysis (Q8_0, Q8_16B).
 
-    The original implementation kept one Python object for every Q8_0 block and
+    The original implementation kept one Python object for every block and
     sorted them at the end. Large GGUFs can contain tens of millions of blocks,
     so that made this phase both CPU- and memory-heavy. This keeps only the
     requested top-N blocks while still accumulating exact per-sublayer totals.
@@ -755,19 +757,22 @@ class Q8BlockOutlierAnalyzer:
         quant_mm: mmap.mmap,
         block_start: int,
         block_count: int,
+        block_size: int = Q8_0_BLOCK_SIZE,
+        block_dtype: np.dtype = Q8_0_DTYPE,
+        block_type: str = "Q8_0",
     ) -> None:
         if block_count <= 0:
             return
 
-        byte_offset = quant_tensor.data_offset + block_start * Q8_0_DTYPE.itemsize
-        raw_blocks = np.frombuffer(quant_mm, dtype=Q8_0_DTYPE, count=block_count, offset=byte_offset)
+        byte_offset = quant_tensor.data_offset + block_start * block_dtype.itemsize
+        raw_blocks = np.frombuffer(quant_mm, dtype=block_dtype, count=block_count, offset=byte_offset)
         scales = raw_blocks["d"].astype(np.float32)
 
-        ref_blocks = ref.reshape(block_count, Q8_0_BLOCK_SIZE)
-        quant_blocks = quant.reshape(block_count, Q8_0_BLOCK_SIZE)
+        ref_blocks = ref.reshape(block_count, block_size)
+        quant_blocks = quant.reshape(block_count, block_size)
         max_abs_ref = np.max(np.abs(ref_blocks), axis=1)
         ref_sq_sum = np.einsum("ij,ij->i", ref_blocks, ref_blocks, dtype=np.float64)
-        rms_ref = np.sqrt(ref_sq_sum / Q8_0_BLOCK_SIZE)
+        rms_ref = np.sqrt(ref_sq_sum / block_size)
         error = np.subtract(quant_blocks, ref_blocks, dtype=np.float32)
         max_abs_error = np.max(np.abs(error), axis=1)
         scores = max_abs_ref / np.maximum(rms_ref, 1e-30)
@@ -784,6 +789,8 @@ class Q8BlockOutlierAnalyzer:
             max_abs_error,
             scores,
             best_index,
+            block_size,
+            block_type,
         )
         layer, sublayer, _ = split_layer_sublayer(ref_tensor.name)
         key = (layer, sublayer)
@@ -813,6 +820,8 @@ class Q8BlockOutlierAnalyzer:
                 max_abs_error,
                 scores,
                 i,
+                block_size,
+                block_type,
             )
             self._push_top_block(block)
 
@@ -826,6 +835,8 @@ class Q8BlockOutlierAnalyzer:
         max_abs_error: np.ndarray,
         scores: np.ndarray,
         i: int,
+        block_size: int = Q8_0_BLOCK_SIZE,
+        block_type: str = "Q8_0",
     ) -> BlockOutlierInfo:
         return BlockOutlierInfo(
             tensor_name=tensor_name,
@@ -835,6 +846,8 @@ class Q8BlockOutlierAnalyzer:
             rms_ref=float(rms_ref[i]),
             max_abs_error=float(max_abs_error[i]),
             outlier_score=float(scores[i]),
+            block_size=block_size,
+            block_type=block_type,
         )
 
     def _push_top_block(self, block: BlockOutlierInfo) -> None:
@@ -947,6 +960,23 @@ def compare_tensor(
             quant = read_values(quant_mm, quant_tensor, start, count)
             stats.update(ref, quant, start)
 
+            if collect_block_outliers and quant_tensor.ggml_type == GGML_Q8_16B:
+                if block_outlier_analyzer is not None:
+                    block_outlier_analyzer.update(
+                        ref_tensor, quant_tensor, ref, quant, quant_mm, block_start, block_count,
+                        block_size=Q8_16B_BLOCK_SIZE,
+                        block_dtype=Q8_16B_DTYPE,
+                        block_type="Q8_16B",
+                    )
+                else:
+                    _collect_block_outliers(
+                        block_outliers, ref_tensor, quant_tensor,
+                        ref, quant, quant_mm, block_start, block_count,
+                        block_size=Q8_16B_BLOCK_SIZE,
+                        block_dtype=Q8_16B_DTYPE,
+                        block_type="Q8_16B",
+                    )
+
             if progress is not None:
                 progress.update(count)
     else:
@@ -961,7 +991,7 @@ def compare_tensor(
     return stats, block_outliers
 
 
-def _collect_q8_0_block_outliers(
+def _collect_block_outliers(
     block_outliers: list[BlockOutlierInfo],
     ref_tensor: TensorInfo,
     quant_tensor: TensorInfo,
@@ -970,17 +1000,20 @@ def _collect_q8_0_block_outliers(
     quant_mm: mmap.mmap,
     block_start: int,
     block_count: int,
+    block_size: int = Q8_0_BLOCK_SIZE,
+    block_dtype: np.dtype = Q8_0_DTYPE,
+    block_type: str = "Q8_0",
 ) -> None:
-    """Compatibility path that materializes per-block outlier objects in block order."""
-    byte_offset = quant_tensor.data_offset + block_start * Q8_0_DTYPE.itemsize
-    raw_blocks = np.frombuffer(quant_mm, dtype=Q8_0_DTYPE, count=block_count, offset=byte_offset)
+    """Materialize per-block outlier objects in block order."""
+    byte_offset = quant_tensor.data_offset + block_start * block_dtype.itemsize
+    raw_blocks = np.frombuffer(quant_mm, dtype=block_dtype, count=block_count, offset=byte_offset)
     scales = raw_blocks["d"].astype(np.float32)
 
-    ref_blocks = ref.reshape(block_count, Q8_0_BLOCK_SIZE)
-    quant_blocks = quant.reshape(block_count, Q8_0_BLOCK_SIZE)
+    ref_blocks = ref.reshape(block_count, block_size)
+    quant_blocks = quant.reshape(block_count, block_size)
     max_abs_ref = np.max(np.abs(ref_blocks), axis=1)
     ref_sq_sum = np.einsum("ij,ij->i", ref_blocks, ref_blocks, dtype=np.float64)
-    rms_ref = np.sqrt(ref_sq_sum / Q8_0_BLOCK_SIZE)
+    rms_ref = np.sqrt(ref_sq_sum / block_size)
     error = np.subtract(quant_blocks, ref_blocks, dtype=np.float32)
     max_abs_error = np.max(np.abs(error), axis=1)
     scores = max_abs_ref / np.maximum(rms_ref, 1e-30)
@@ -994,7 +1027,25 @@ def _collect_q8_0_block_outliers(
             rms_ref=float(rms_ref[i]),
             max_abs_error=float(max_abs_error[i]),
             outlier_score=float(scores[i]),
+            block_size=block_size,
+            block_type=block_type,
         ))
+
+
+def _collect_q8_0_block_outliers(
+    block_outliers: list[BlockOutlierInfo],
+    ref_tensor: TensorInfo,
+    quant_tensor: TensorInfo,
+    ref: np.ndarray,
+    quant: np.ndarray,
+    quant_mm: mmap.mmap,
+    block_start: int,
+    block_count: int,
+) -> None:
+    _collect_block_outliers(
+        block_outliers, ref_tensor, quant_tensor,
+        ref, quant, quant_mm, block_start, block_count,
+    )
 
 
 def passes_filters(name: str, include: re.Pattern[str] | None, exclude: re.Pattern[str] | None) -> bool:
@@ -1263,6 +1314,8 @@ def _block_outlier_to_row(b: BlockOutlierInfo) -> dict[str, Any]:
         "sublayer": sublayer,
         "block_index": b.block_index,
         "global_element_index": b.global_element_index,
+        "block_size": b.block_size,
+        "block_type": b.block_type,
         "scale": b.scale,
         "max_abs_ref": b.max_abs_ref,
         "rms_ref": b.rms_ref,
@@ -1278,6 +1331,8 @@ BLOCK_OUTLIER_CSV_FIELDS = [
     "sublayer",
     "block_index",
     "global_element_index",
+    "block_size",
+    "block_type",
     "scale",
     "max_abs_ref",
     "rms_ref",
